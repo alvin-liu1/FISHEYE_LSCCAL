@@ -20,20 +20,24 @@ OUTPUT_DIR = 'output_images_manual_raw_interactive' # 修改输出目录，便�
 # 亮度补偿网格数量 (例如 17x17)
 GRID_ROWS = 13 # 网格行数
 GRID_COLS = 17 # 网格列数 
-# 目标亮度值 (0.0-1.0范围)。如果你的RAW是10bit，那么目标亮度是0-1023，这里归一化到0-1。
-# 例如，0.5 意味着目标亮度是 1023 * 0.5 = 511.5
-TARGET_BRIGHTNESS = 0.5 
-# HoughCircles 参数 (现在可选，因为可以使用手动选择)
-HOUGH_DP = 1.2
-HOUGH_MIN_DIST = 50
-HOUGH_PARAM1 = 100
-HOUGH_PARAM2 = 30
-HOUGH_MIN_RADIUS = 500
-HOUGH_MAX_RADIUS = 2000
+
 # 掩码羽化程度（像素）。增加羽化像素宽度，可以尝试 50, 80, 100, 120等，直到过渡自然
 MASK_FEATHER_PIXELS = 100 
-# 增益裁剪限制 (防止过高增益)。允许的最大增益，避免过亮，可以尝试 3.0, 4.0, 5.0
-MAX_GAIN = 5.0 
+
+# 【关键参数】增益裁剪限制。这是控制LSC校正强度和噪声放大之间平衡的最重要参数。
+# 值越高，暗角校正越彻底，但噪声也越大。对于平台Tuning，通常建议使用2.0到4.0之间的值。
+MAX_GAIN = 4.0 
+
+# 【关键参数】衰减因子 (Falloff Factor)。
+# 该值控制LSC校正的强度。小于1.0会减弱对边缘暗角的补偿，从而避免产生亮环。
+# 建议值范围：0.7 - 1.0。
+FALLOFF_FACTOR = 0.85
+
+# 【关键参数】网格有效性门槛比例。
+# 如果一个网格的平均G通道亮度低于 (中心G通道亮度 * 此比例)，则该网格被视为无效，其所有增益将被设为1.0。
+# 这可以有效防止对鱼眼镜头边缘的过暗区域进行过度补偿。建议值范围：0.02 - 0.1 (即2%到10%)
+VALID_GRID_THRESHOLD_RATIO = 0.05
+
 # --- 新增参数：手动调整的步长 ---
 MANUAL_ADJUST_STEP = 1 # 调整步长，可以设置为1、2、5等，数值越小精度越高
 # --- Matplotlib 中文字体配置 (此函数将不再配置中文字体，而是确保英文显示正常) ---
@@ -434,23 +438,83 @@ def plot_heatmap_and_save_matrix(matrix, title_suffix, channel_name, grid_rows, 
     plt.close() # 关闭图表，防止在循环中打开过多窗口
     print(f"已保存 {channel_name} 通道热力图至 {filename}") # 打印内容仍为中文
 
-def save_gain_matrix_to_txt(matrix, channel_name, grid_rows, grid_cols, raw_path_for_naming, output_base_dir):
+def save_gain_matrix_to_txt(matrix, channel_name, raw_path_for_naming, output_base_dir, is_golden=False):
     """将增益矩阵保存为文本文件。"""
     raw_filename_base = os.path.splitext(os.path.basename(raw_path_for_naming))[0]
     output_dir_matrices = os.path.join(output_base_dir, 'gain_matrices')
     os.makedirs(output_dir_matrices, exist_ok=True)
     
-    filename = os.path.join(output_dir_matrices, f"{raw_filename_base}_{channel_name}_gain_matrix.txt")
+    if is_golden:
+        filename = os.path.join(output_dir_matrices, f"{raw_filename_base}_{channel_name}_golden_table_for_tuning.txt")
+        header = f"用于Tuning的Golden增益表 (1024 / script_gain) - {channel_name} 通道:"
+        fmt_str = '%d' # 保存为整数
+    else:
+        filename = os.path.join(output_dir_matrices, f"{raw_filename_base}_{channel_name}_script_gain.txt")
+        header = f"脚本计算出的原始增益 - {channel_name} 通道:"
+        fmt_str = '%.4f' # 保存为浮点数
+
+    # 将矩阵展平并格式化为单行字符串，使用空格分隔
+    flat_matrix = matrix.flatten()
+    formatted_line = " ".join([fmt_str % num for num in flat_matrix])
+
+    with open(filename, 'w') as f:
+        f.write(f'# {header}\n')
+        f.write(formatted_line + '\n')
+
+    print(f"已保存 {header.split('-')[0].strip()} 至: {filename}")
+
+
+# 【新增】增益平滑函数
+def smooth_gain_table(gain_table, kernel_size=3):
+    """
+    对增益矩阵进行平滑处理以消除异常值。
+    Args:
+        gain_table (np.array): 原始增益矩阵。
+        kernel_size (int): 高斯模糊的核大小，必须为奇数。
+    Returns:
+        np.array: 平滑后的增益矩阵。
+    """
+    if kernel_size % 2 == 0:
+        kernel_size += 1 # 确保核大小为奇数
+    # 使用高斯模糊进行平滑
+    smoothed_table = cv2.GaussianBlur(gain_table, (kernel_size, kernel_size), 0)
+    return smoothed_table
+
+# 【新增】增益对称化函数
+def symmetrize_gain_table(gain_table):
+    """
+    通过取对称点平均值的方式，强制使增益矩阵中心对称。
+    Args:
+        gain_table (np.array): 原始增益矩阵。
+    Returns:
+        np.array: 对称化处理后的增益矩阵。
+    """
+    rows, cols = gain_table.shape
+    symmetrized_table = gain_table.copy()
     
-    header = f"{channel_name} 通道增益矩阵 ({grid_rows}x{grid_cols}):" # 文件头保持中文
-    np.savetxt(filename, matrix, fmt='%.4f', header=header, comments='')
-    print(f"已保存 {channel_name} 通道增益矩阵至 {filename}") # 打印内容仍为中文
+    # 仅需遍历一半的表格即可
+    for r in range((rows + 1) // 2):
+        for c in range(cols):
+            # 找到对称点
+            sym_r = rows - 1 - r
+            sym_c = cols - 1 - c
+            
+            # 计算对称点的平均值
+            avg_val = (symmetrized_table[r, c] + symmetrized_table[sym_r, sym_c]) / 2.0
+            
+            # 将平均值赋给对称点
+            symmetrized_table[r, c] = avg_val
+            symmetrized_table[sym_r, sym_c] = avg_val
+            
+    return symmetrized_table
 
 # --- 核心校准函数 (主要修改：拜耳数据转换为8-bit用于显示时进行10-bit归一化) ---
 def perform_brightness_compensation_with_circle_mask(raw_img_path, width, height, bayer_pattern, 
-                                                    grid_rows, grid_cols, target_brightness=None, 
-                                                     feather_pixels=50, max_gain=5.0,
-                                                     use_manual_selection=True):
+                                                    grid_rows, grid_cols, 
+                                                    feather_pixels=100, max_gain=4.0,
+                                                    valid_grid_threshold_ratio=0.05,
+                                                    falloff_factor=0.85,
+                                                    use_manual_selection=True):
     print(f"--- 开始亮度补偿处理：{os.path.basename(raw_img_path)} ---")
     print(f"图像尺寸: {width}x{height}, 网格大小: {grid_rows}x{grid_cols}")
     
@@ -484,83 +548,114 @@ def perform_brightness_compensation_with_circle_mask(raw_img_path, width, height
 
     grid_brightness_maps = {ch: np.zeros((grid_rows, grid_cols), dtype=np.float32) for ch in ['R', 'Gr', 'Gb', 'B']}
     epsilon = 1e-6
-    # 如果函数调用时没有指定 target_brightness (即为 None)，或者中心网格亮度过低，则使用全局默认值
-    final_target_brightness_for_calculation = target_brightness if target_brightness is not None else TARGET_BRIGHTNESS
     
     for ch_name, channel_data_sparse in bayer_channels_float.items():
         for i in range(grid_rows): # 遍历行
             for j in range(grid_cols): # 遍历列
-                y_start = i * H_grid_cell_size # 使用新的变量名
-                y_end = min((i + 1) * H_grid_cell_size, h) # 使用新的变量名
-                x_start = j * W_grid_cell_size # 使用新的变量名
-                x_end = min((j + 1) * W_grid_cell_size, w) # 使用新的变量名
+                y_start = i * H_grid_cell_size
+                y_end = min((i + 1) * H_grid_cell_size, h)
+                x_start = j * W_grid_cell_size
+                x_end = min((j + 1) * W_grid_cell_size, w)
 
                 grid_area_channel = channel_data_sparse[y_start:y_end, x_start:x_end]
                 mask_area = feathered_mask_2d[y_start:y_end, x_start:x_end]
-                valid = (grid_area_channel > epsilon) & (mask_area > epsilon)
+                valid_pixels = (grid_area_channel > epsilon) & (mask_area > epsilon)
 
-                if np.any(valid):
-                    grid_brightness_maps[ch_name][i, j] = np.sum(grid_area_channel[valid] * mask_area[valid]) / (np.sum(mask_area[valid]) + epsilon)
+                if np.any(valid_pixels):
+                    grid_brightness_maps[ch_name][i, j] = np.sum(grid_area_channel[valid_pixels] * mask_area[valid_pixels]) / (np.sum(mask_area[valid_pixels]) + epsilon)
                 else:
                     grid_brightness_maps[ch_name][i, j] = 0.0
 
-    # 设置 target_brightness 为中心网格的 R/Gr/Gb/B 四通道亮度平均值
-    center_row_idx = grid_rows // 2 # 修改这里
-    center_col_idx = grid_cols // 2 # 修改这里
-    center_brightness_values = [
-        grid_brightness_maps['R'][center_row_idx, center_col_idx], # 修改这里
-        grid_brightness_maps['Gr'][center_row_idx, center_col_idx], # 修改这里
-        grid_brightness_maps['Gb'][center_row_idx, center_col_idx], # 修改这里
-        grid_brightness_maps['B'][center_row_idx, center_col_idx] # 修改这里
-    ]
-    target_brightness = np.mean(center_brightness_values)
-    print(f"自动设定的目标亮度为中心网格 ({center_row_idx},{center_col_idx}) 的平均亮度: {target_brightness:.4f}") # 修改这里
+    # --- 【最终优化算法 V14】: G通道优先 + 衰减因子 + 平滑 + 对称 ---
+    # 最终确认：该算法旨在生成能同时校正Luma和Chroma，且不引入色偏的LSC表。
+    print("\n--- 开始使用“G通道优先 + 衰减因子 + 平滑 + 对称”算法计算增益 (V14) ---")
+    center_row_idx = grid_rows // 2
+    center_col_idx = grid_cols // 2
 
-    gain_matrices = {}
-    for ch_name, brightness_map in grid_brightness_maps.items():
-        center_val = brightness_map[center_row_idx, center_col_idx]
-        target_brightness_ch = center_val if center_val > epsilon else final_target_brightness_for_calculation 
-        gain = np.where(brightness_map > epsilon, target_brightness_ch/ brightness_map, 1.0)
-        gain = np.clip(gain, 1.0, max_gain)
-        gain_matrices[ch_name] = gain
-        # 1. 保存原始增益矩阵到txt文件
-        save_gain_matrix_to_txt(gain, ch_name, grid_rows, grid_cols, raw_img_path, OUTPUT_DIR) # 传入行和列
+    # 1. 计算理论增益
+    G_avg_map = (grid_brightness_maps['Gr'] + grid_brightness_maps['Gb']) / 2.0
+    R_map = grid_brightness_maps['R']
+    B_map = grid_brightness_maps['B']
+    
+    center_G_avg = G_avg_map[center_row_idx, center_col_idx]
+    center_R = R_map[center_row_idx, center_col_idx]
+    center_B = B_map[center_row_idx, center_col_idx]
+
+    if center_G_avg < epsilon:
+        print("错误：中心区域G通道亮度过低，无法进行LSC计算。")
+        return None, None, None, None
+
+    # Luma gain
+    gain_G_raw = np.where(G_avg_map > epsilon, center_G_avg / G_avg_map, 1.0)
+    
+    # Chroma gain
+    target_ratio_R_G = center_R / (center_G_avg + epsilon)
+    target_ratio_B_G = center_B / (center_G_avg + epsilon)
+    print(f"中心点目标颜色比例: R/G={target_ratio_R_G:.4f}, B/G={target_ratio_B_G:.4f}")
+
+    current_ratio_R_G = np.where(G_avg_map > epsilon, R_map / G_avg_map, 0)
+    gain_R_correction = np.where(current_ratio_R_G > epsilon, target_ratio_R_G / current_ratio_R_G, 1.0)
+    gain_R_raw = gain_G_raw * gain_R_correction
+
+    current_ratio_B_G = np.where(G_avg_map > epsilon, B_map / G_avg_map, 0)
+    gain_B_correction = np.where(current_ratio_B_G > epsilon, target_ratio_B_G / current_ratio_B_G, 1.0)
+    gain_B_raw = gain_G_raw * gain_B_correction
+
+    # 2. 应用衰减因子
+    print(f"应用衰减因子: {falloff_factor}")
+    gain_R_falloff = np.power(gain_R_raw, falloff_factor)
+    gain_G_falloff = np.power(gain_G_raw, falloff_factor) # G通道也需要应用
+    gain_B_falloff = np.power(gain_B_raw, falloff_factor)
+    
+    # 3. 平滑处理
+    print("对理论增益进行平滑处理...")
+    gain_R_smoothed = smooth_gain_table(gain_R_falloff)
+    gain_G_smoothed = smooth_gain_table(gain_G_falloff)
+    gain_B_smoothed = smooth_gain_table(gain_B_falloff)
+    
+    # 4. 对称化处理
+    print("对平滑后的增益进行对称化处理...")
+    gain_R_sym = symmetrize_gain_table(gain_R_smoothed)
+    gain_G_sym = symmetrize_gain_table(gain_G_smoothed)
+    gain_B_sym = symmetrize_gain_table(gain_B_smoothed)
+
+    # 5. 有效性质询
+    validity_threshold = center_G_avg * valid_grid_threshold_ratio
+    print(f"中心G通道平均亮度: {center_G_avg:.4f}, 有效性质询门槛: {validity_threshold:.4f}")
+    master_valid_mask = G_avg_map > validity_threshold
+
+    # 6. 应用有效性掩码
+    gain_R_sym[~master_valid_mask] = 1.0
+    gain_G_sym[~master_valid_mask] = 1.0
+    gain_B_sym[~master_valid_mask] = 1.0
+    
+    # 7. 最终裁剪
+    script_gain_matrices = {
+        'R': np.clip(gain_R_sym, 1.0, max_gain),
+        'Gr': np.clip(gain_G_sym, 1.0, max_gain),
+        'Gb': np.clip(gain_G_sym, 1.0, max_gain),
+        'B': np.clip(gain_B_sym, 1.0, max_gain)
+    }
+    print("已使用“G通道优先 + 衰减因子 + 平滑 + 对称”机制计算脚本增益矩阵。")
+
+
+    # --- 保存和可视化增益矩阵 ---
+    for ch_name, gain in script_gain_matrices.items():
+        # 保存脚本计算出的原始增益
+        save_gain_matrix_to_txt(gain, ch_name, raw_img_path, OUTPUT_DIR, is_golden=False)
         
-        # 2. 调用热力图生成函数 (重新添加这一行)
-        plot_heatmap_and_save_matrix(gain, "Gain Map", ch_name, grid_rows, grid_cols, raw_img_path, OUTPUT_DIR) # 传入行和列
+        # 调用热力图生成函数
+        plot_heatmap_and_save_matrix(gain, "Script Gain (V14)", ch_name, grid_rows, grid_cols, raw_img_path, OUTPUT_DIR)
 
-        # 3. 新增：保存乘以 1024 的增益矩阵
-        scaled_gain = gain * 1024 # 假设 gain 是 17x17 的 NumPy 数组
-        scaled_gain_path = os.path.join(OUTPUT_DIR, 'gain_matrices', f"{os.path.splitext(os.path.basename(raw_img_path))[0]}_{ch_name}_gain_matrix_x1024.txt")
+        # 计算并保存用于Tuning的Golden增益表
+        golden_table = 1024 / (gain + epsilon)
+        save_gain_matrix_to_txt(golden_table, ch_name, raw_img_path, OUTPUT_DIR, is_golden=True)
 
-        # --- 新增的目录创建代码 ---
-        output_gain_dir = os.path.dirname(scaled_gain_path) # 获取增益矩阵文件所在的目录
-        if not os.path.exists(output_gain_dir): # 检查目录是否存在
-           os.makedirs(output_gain_dir, exist_ok=True) # 如果不存在，则创建它，exist_ok=True 表示如果目录已存在，则不会报错
-
-        # --- 关键修改：手动将矩阵展平并格式化为单行字符串 ---
-        # 1. 将 2D 矩阵展平为 1D 数组 (先行后列)
-        flat_scaled_gain = scaled_gain.flatten()
-
-        # 2. 将每个数字转换为整数（四舍五入）并再转换为字符串
-        str_numbers = [str(int(round(num))) for num in flat_scaled_gain]
-
-        # 3. 使用 ", " 连接所有数字字符串，join() 方法会自动处理最后一个元素后面没有分隔符
-        formatted_line = ", ".join(str_numbers)
-
-        # 4. 打开文件并写入格式化后的单行数据
-        with open(scaled_gain_path, 'w') as f:
-          # 写入文件头（可选，但通常有助于理解文件内容）
-             f.write(f'# {ch_name} 通道增益矩阵 (×1024) - 单行格式\n')
-          # 写入格式化后的数据行
-             f.write(formatted_line + '\n') # 添加换行符以确保文件以新行结束
-
-        print(f"已保存 {ch_name} 通道 ×1024 增益矩阵至: {scaled_gain_path}")
-
-    gain_map_R_full = cv2.resize(gain_matrices['R'], (w, h), interpolation=cv2.INTER_LINEAR)
-    gain_map_Gr_full = cv2.resize(gain_matrices['Gr'], (w, h), interpolation=cv2.INTER_LINEAR)
-    gain_map_Gb_full = cv2.resize(gain_matrices['Gb'], (w, h), interpolation=cv2.INTER_LINEAR)
-    gain_map_B_full = cv2.resize(gain_matrices['B'], (w, h), interpolation=cv2.INTER_LINEAR)
+    # 为了可视化，我们仍然使用脚本增益进行补偿
+    gain_map_R_full = cv2.resize(script_gain_matrices['R'], (w, h), interpolation=cv2.INTER_LINEAR)
+    gain_map_Gr_full = cv2.resize(script_gain_matrices['Gr'], (w, h), interpolation=cv2.INTER_LINEAR)
+    gain_map_Gb_full = cv2.resize(script_gain_matrices['Gb'], (w, h), interpolation=cv2.INTER_LINEAR)
+    gain_map_B_full = cv2.resize(script_gain_matrices['B'], (w, h), interpolation=cv2.INTER_LINEAR)
 
     compensated_bayer_16bit = apply_gain_to_bayer(
         original_bayer_16bit, 
@@ -577,12 +672,7 @@ def perform_brightness_compensation_with_circle_mask(raw_img_path, width, height
     compensated_rgb_float_wb = simple_white_balance(compensated_rgb_float, mask_2d=feathered_mask_2d)
 
     print("--- 亮度补偿处理完成 ---")
-    return original_rgb_float_wb, compensated_rgb_float_wb, original_rgb_float_no_wb, {
-        'R': gain_map_R_full,
-        'Gr': gain_map_Gr_full,
-        'Gb': gain_map_Gb_full,
-        'B': gain_map_B_full
-    }
+    return original_rgb_float_wb, compensated_rgb_float_wb, original_rgb_float_no_wb, script_gain_matrices
 
 
 def visualize_results_circle_mask(original_img_wb, compensated_img_wb, original_img_no_wb, gain_data_full_size, output_dir='.'):
@@ -701,14 +791,15 @@ if __name__ == '__main__':
         print("--- 虚拟RAW文件创建完毕 ---") 
 
     # 执行亮度补偿主函数
-    original_rgb_for_display_wb, compensated_rgb_final_wb, original_rgb_for_display_no_wb, gain_maps_4ch_full_size = \
+    original_rgb_for_display_wb, compensated_rgb_final_wb, original_rgb_for_display_no_wb, script_gain_matrices = \
         perform_brightness_compensation_with_circle_mask(
             RAW_IMAGE_PATH, IMAGE_WIDTH, IMAGE_HEIGHT, BAYER_PATTERN,
             grid_rows=GRID_ROWS,
             grid_cols=GRID_COLS,
-            target_brightness=TARGET_BRIGHTNESS, # <--- 修改这里，使用关键字参数
             feather_pixels=MASK_FEATHER_PIXELS,
             max_gain=MAX_GAIN,
+            valid_grid_threshold_ratio=VALID_GRID_THRESHOLD_RATIO,
+            falloff_factor=FALLOFF_FACTOR,
             use_manual_selection=USE_MANUAL_CIRCLE_SELECTION
         )
 
@@ -735,11 +826,11 @@ if __name__ == '__main__':
 
         npz_output_path = os.path.join(OUTPUT_DIR, f'{base_filename}_gain_maps_full_size.npz')
         np.savez(npz_output_path,
-                 R=gain_maps_4ch_full_size['R'], 
-                 Gr=gain_maps_4ch_full_size['Gr'], 
-                 Gb=gain_maps_4ch_full_size['Gb'], 
-                 B=gain_maps_4ch_full_size['B'])
+                 R=script_gain_matrices['R'], 
+                 Gr=script_gain_matrices['Gr'], 
+                 Gb=script_gain_matrices['Gb'], 
+                 B=script_gain_matrices['B'])
         print(f"增益图 (完整尺寸) 已保存至: {npz_output_path}") 
-        visualize_results_circle_mask(original_rgb_for_display_wb, compensated_rgb_final_wb, original_rgb_for_display_no_wb, gain_maps_4ch_full_size, OUTPUT_DIR)
+        visualize_results_circle_mask(original_rgb_for_display_wb, compensated_rgb_final_wb, original_rgb_for_display_no_wb, script_gain_matrices, OUTPUT_DIR)
     else:
         print("补偿过程失败。请检查之前的错误信息。")
