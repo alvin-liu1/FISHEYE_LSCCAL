@@ -1,3 +1,23 @@
+# ===================================================================================
+# LSC (Lens Shading Correction) Calibration Script
+# Version: V15.5 - Fixed Center Point
+#
+# Description:
+# This script is designed to generate LSC gain tables for fisheye lenses,
+# specifically tailored for platforms like Qualcomm's. It addresses issues
+# such as luma shading, chroma shading, and bright halos at the edges for
+# panoramic stitching.
+#
+# Core Algorithm:
+# "G-Channel Priority with Color Ratio Lock" combined with a comprehensive
+# robustness pipeline.
+#
+# Changes in this Version:
+# - Reverted to using a fixed geometric center point for calibration as per user feedback,
+#   as the dynamic center point caused issues in some cases.
+# - Kept the "Black Level Correction" and "Remember Chosen Region" features.
+# ===================================================================================
+
 import cv2
 import numpy as np
 import matplotlib.pyplot as plt
@@ -6,9 +26,13 @@ import matplotlib.font_manager as fm
 
 # --- 配置参数 ---
 # 请根据你的实际文件和相机参数进行修改！
-RAW_IMAGE_PATH = '25k.raw' # 假设你的裸RAW文件路径
+RAW_IMAGE_PATH = '0715_25k.raw' # 假设你的裸RAW文件路径
 IMAGE_WIDTH = 1256 # 你的RAW图像宽度
 IMAGE_HEIGHT = 1256 # 你的RAW图像高度
+
+# 【功能】黑电平参数 (根据你的传感器规格设定，通常是10-bit或12-bit数据)
+# 例如，对于10-bit RAW (0-1023)，黑电平可能是64。
+BLACK_LEVELS = {'R': 64, 'Gr': 64, 'Gb': 64, 'B': 64}
 
 # 根据你的相机传感器实际拜耳模式选择。常见的有：
 # cv2.COLOR_BayerBG2BGR_VNG  # BGGR 模式
@@ -17,26 +41,27 @@ IMAGE_HEIGHT = 1256 # 你的RAW图像高度
 # cv2.COLOR_BayerGB2BGR_VNG  # GBRG 模式
 BAYER_PATTERN =  cv2.COLOR_BayerGR2BGR_VNG # 默认为 GRBG 模式，请务必根据实际情况修改！
 OUTPUT_DIR = 'output_images_manual_raw_interactive' # 修改输出目录，便于区分
-# 亮度补偿网格数量 (例如 17x17)
-GRID_ROWS = 13 # 网格行数
-GRID_COLS = 17 # 网格列数 
 
-# 掩码羽化程度（像素）。增加羽化像素宽度，可以尝试 50, 80, 100, 120等，直到过渡自然
-MASK_FEATHER_PIXELS = 100 
-
-# 【关键参数】增益裁剪限制。这是控制LSC校正强度和噪声放大之间平衡的最重要参数。
-# 值越高，暗角校正越彻底，但噪声也越大。对于平台Tuning，通常建议使用2.0到4.0之间的值。
-MAX_GAIN = 4.0 
-
+# 此时应关闭此选项，让算法根据真实数据进行非对称校正。
+APPLY_SYMMETRY = False # 设为 False 来解决左右色偏问题
 # 【关键参数】衰减因子 (Falloff Factor)。
-# 该值控制LSC校正的强度。小于1.0会减弱对边缘暗角的补偿，从而避免产生亮环。
+# 该值控制LSC校正在【边界处】的补偿强度。小于1.0会减弱对边缘暗角的补偿，从而避免产生亮环。
 # 建议值范围：0.7 - 1.0。
-FALLOFF_FACTOR = 0.8
+FALLOFF_FACTOR = 1
+# 亮度补偿网格数量
+GRID_ROWS = 13
+GRID_COLS = 17
+# 掩码羽化
+MASK_FEATHER_PIXELS = 120
+# 增益裁剪限制
+MAX_GAIN = 2.5
+# 【新增关键参数】颜色校正衰减因子
+COLOR_FALLOFF_FACTOR = 1
 
 # 【关键参数】网格有效性门槛比例。
 # 如果一个网格的平均G通道亮度低于 (中心G通道亮度 * 此比例)，则该网格被视为无效，其所有增益将被设为1.0。
 # 这可以有效防止对鱼眼镜头边缘的过暗区域进行过度补偿。建议值范围：0.02 - 0.1 (即2%到10%)
-VALID_GRID_THRESHOLD_RATIO = 0.05
+VALID_GRID_THRESHOLD_RATIO = 0.2
 
 # --- 新增参数：手动调整的步长 ---
 MANUAL_ADJUST_STEP = 1 # 调整步长，可以设置为1、2、5等，数值越小精度越高
@@ -52,7 +77,6 @@ set_matplotlib_english_font()
 def read_raw_bayer_image_manual(raw_path, width, height):
     """
     手动读取10-bit或16-bit的裸RAW数据，并返回16-bit的Numpy数组。
-    假设10-bit数据存储在16-bit容器中 (例如，每个像素占用2字节)。
     Args:
         raw_path (str): 裸RAW文件路径。
         width (int): 图像宽度。
@@ -64,74 +88,67 @@ def read_raw_bayer_image_manual(raw_path, width, height):
         expected_pixels = width * height
         # 核心修改：明确指定读取的元素数量为 expected_pixels
         bayer_data_16bit_raw = np.fromfile(raw_path, dtype='<u2', count=expected_pixels) # '<u2' for little-endian uint16
-        
+
         # 再次检查读取到的元素数量是否与预期相符，以防文件过小
         if bayer_data_16bit_raw.size != expected_pixels:
-            raise ValueError(f"Raw file size mismatch after attempting to read expected count. Expected {expected_pixels} pixels, but got {bayer_data_16bit_raw.size}. This might indicate the file is too small or still has an unexpected structure.")
+            raise ValueError(f"Raw file size mismatch after attempting to read expected count. Expected {expected_pixels} pixels, but got {bayer_data_16bit_raw.size}.")
 
         bayer_image_16bit = bayer_data_16bit_raw.reshape((height, width))
         return bayer_image_16bit
     except Exception as e:
         print(f"Error reading raw image: {e}")
         return None
-# --- 新增函数：根据拜耳模式分离R, Gr, Gb, B通道 ---
-def extract_bayer_channels(bayer_image_16bit, bayer_pattern_code):
-    """
-    根据拜耳模式从16-bit拜耳图像中提取R, Gr, Gb, B通道。
-    返回的每个通道都是原始图像大小的矩阵，非零部分包含该通道的像素值，
-    其他部分为0。像素值被归一化到0-1范围 (基于10-bit RAW数据的最大值1023)。
-    Args:
-        bayer_image_16bit (np.array): 16-bit的拜耳图像数据。
-        bayer_pattern_code (int): OpenCV的拜耳模式常量，如 cv2.COLOR_BayerRG2BGR_VNG。
-    Returns:
-        dict: 包含 'R', 'Gr', 'Gb', 'B' 键的字典，每个值为对应通道的图像矩阵。
-    """
-    h, w = bayer_image_16bit.shape
-    
-    R = np.zeros_like(bayer_image_16bit, dtype=np.float32)
-    Gr = np.zeros_like(bayer_image_16bit, dtype=np.float32)
-    Gb = np.zeros_like(bayer_image_16bit, dtype=np.float32)
-    B = np.zeros_like(bayer_image_16bit, dtype=np.float32)
-    # *** 关键修改在这里：根据10bit RAW数据，归一化到0-1范围，分母是 1023.0 ***
-    bayer_float = bayer_image_16bit.astype(np.float32) / 1023.0 
 
+def extract_bayer_channels(bayer_blc_float, bayer_pattern_code):
+    """
+    【V3】将已经去除黑电平的浮点bayer数据分离并归一化。
+    Args:
+        bayer_blc_float (np.array): 已经减去黑电平的浮点bayer图像数据。
+        bayer_pattern_code (int): OpenCV的拜耳模式常量。
+    Returns:
+        dict: 包含 'R', 'Gr', 'Gb', 'B' 键的字典。
+    """
+    h, w = bayer_blc_float.shape
+    # 1. 归一化。假设信号范围是 1023 (10-bit)。
+    # 注意：此时黑电平已经是0，所以直接除以最大值即可。
+    normalized_bayer = bayer_blc_float / (1023.0 - 64.0) # 使用平均G通道黑电平作为基准
+    normalized_bayer = np.clip(normalized_bayer, 0, 1.0)
+
+    # 2. 初始化四个独立的通道
+    R, Gr, Gb, B = [np.zeros((h, w), dtype=np.float32) for _ in range(4)]
+
+    # 3. 根据拜耳模式，将归一化后的数据分离到对应的通道矩阵中
     if bayer_pattern_code == cv2.COLOR_BayerRG2BGR_VNG: # RGGB
-        R[0::2, 0::2] = bayer_float[0::2, 0::2]
-        Gr[0::2, 1::2] = bayer_float[0::2, 1::2]
-        Gb[1::2, 0::2] = bayer_float[1::2, 0::2]
-        B[1::2, 1::2] = bayer_float[1::2, 1::2]
-    elif bayer_pattern_code == cv2.COLOR_BayerGR2BGR_VNG: # GRBG 
-        Gr[0::2, 0::2] = bayer_float[0::2, 0::2]
-        R[0::2, 1::2] = bayer_float[0::2, 1::2]
-        B[1::2, 0::2] = bayer_float[1::2, 0::2]
-        Gb[1::2, 1::2] = bayer_float[1::2, 1::2]
+        R[0::2, 0::2] = normalized_bayer[0::2, 0::2]
+        Gr[0::2, 1::2] = normalized_bayer[0::2, 1::2]
+        Gb[1::2, 0::2] = normalized_bayer[1::2, 0::2]
+        B[1::2, 1::2] = normalized_bayer[1::2, 1::2]
+    elif bayer_pattern_code == cv2.COLOR_BayerGR2BGR_VNG: # GRBG
+        Gr[0::2, 0::2] = normalized_bayer[0::2, 0::2]
+        R[0::2, 1::2] = normalized_bayer[0::2, 1::2]
+        B[1::2, 0::2] = normalized_bayer[1::2, 0::2]
+        Gb[1::2, 1::2] = normalized_bayer[1::2, 1::2]
     elif bayer_pattern_code == cv2.COLOR_BayerBG2BGR_VNG: # BGGR
-        B[0::2, 0::2] = bayer_float[0::2, 0::2]
-        Gb[0::2, 1::2] = bayer_float[0::2, 1::2]
-        Gr[1::2, 0::2] = bayer_float[1::2, 0::2]
-        R[1::2, 1::2] = bayer_float[1::2, 1::2]
+        B[0::2, 0::2] = normalized_bayer[0::2, 0::2]
+        Gb[0::2, 1::2] = normalized_bayer[0::2, 1::2]
+        Gr[1::2, 0::2] = normalized_bayer[1::2, 0::2]
+        R[1::2, 1::2] = normalized_bayer[1::2, 1::2]
     elif bayer_pattern_code == cv2.COLOR_BayerGB2BGR_VNG: # GBRG
-        Gb[0::2, 0::2] = bayer_float[0::2, 0::2]
-        B[0::2, 1::2] = bayer_float[0::2, 1::2]
-        R[1::2, 0::2] = bayer_float[1::2, 0::2]
-        Gr[1::2, 1::2] = bayer_float[1::2, 1::2]
+        Gb[0::2, 0::2] = normalized_bayer[0::2, 0::2]
+        B[0::2, 1::2] = normalized_bayer[0::2, 1::2]
+        R[1::2, 0::2] = normalized_bayer[1::2, 0::2]
+        Gr[1::2, 1::2] = normalized_bayer[1::2, 1::2]
     else:
         raise ValueError("Unsupported Bayer pattern code.")
 
     return {'R': R, 'Gr': Gr, 'Gb': Gb, 'B': B}
-# --- 新增函数：应用增益回拜耳数据 ---
-def apply_gain_to_bayer(bayer_image_16bit, gain_map_R, gain_map_Gr, gain_map_Gb, gain_map_B, bayer_pattern_code):
+
+# --- 【V3 - 逻辑重构】---
+def apply_gain_to_bayer(bayer_blc_float, gain_map_R, gain_map_Gr, gain_map_Gb, gain_map_B, bayer_pattern_code):
     """
-    将单独通道的增益图应用回16-bit拜耳图像。
-    注意：这里的增益图是归一化后的增益，需要乘以原始的像素值（在1023范围内）。
-    Args:
-        bayer_image_16bit (np.array): 原始16-bit拜耳图像。
-        gain_map_R, gain_map_Gr, gain_map_Gb, gain_map_B (np.array): 对应通道的增益图。
-        bayer_pattern_code (int): OpenCV的拜耳模式常量。
-    Returns:
-        np.array: 增益补偿后的16-bit拜尔图像。
+    【V3】将增益图应用到已经去除黑电平的浮点bayer数据上。
     """
-    compensated_bayer_float = bayer_image_16bit.astype(np.float32) # 转换为浮点进行计算，仍保持0-65535范围
+    compensated_bayer_float = bayer_blc_float.copy()
 
     if bayer_pattern_code == cv2.COLOR_BayerRG2BGR_VNG: # RGGB
         compensated_bayer_float[0::2, 0::2] *= gain_map_R[0::2, 0::2]
@@ -153,29 +170,17 @@ def apply_gain_to_bayer(bayer_image_16bit, gain_map_R, gain_map_Gr, gain_map_Gb,
         compensated_bayer_float[0::2, 1::2] *= gain_map_B[0::2, 1::2]
         compensated_bayer_float[1::2, 0::2] *= gain_map_R[1::2, 0::2]
         compensated_bayer_float[1::2, 1::2] *= gain_map_Gr[1::2, 1::2]
-    # 限制到16bit范围
-    compensated_bayer_16bit = np.clip(compensated_bayer_float, 0, 65535).astype(np.uint16)
-    return compensated_bayer_16bit
 
-# --- 【优化后的白平衡函数】 ---
+    return compensated_bayer_float # 返回的也是浮点数
+
+# --- 【恢复】白平衡函数 ---
 def simple_white_balance(image_rgb_float, mask_2d=None):
     """
     对RGB图像进行稳健的自动白平衡。
-    【优化点】: 不再使用整个图像区域，而是使用图像中心的一块矩形区域(例如中心40%x40%的区域)
-    来计算R/G/B的平均值。这提供了一个更稳定和准确的“白色”参考，
-    不易受到LSC在边缘处可能存在的残留误差的影响，从而提高Chroma Shading的校正效果。
-
-    Args:
-        image_rgb_float (np.array): 浮点型RGB图像 (0-1)。
-        mask_2d (np.array, optional): 2D掩码。此函数中，它主要用于判断是否需要进行白平衡，
-                                      但计算基准始终在中心区域。
-    Returns:
-        np.array: 白平衡后的RGB图像 (浮点型, 0-1)。
     """
     if image_rgb_float.shape[2] != 3:
         raise ValueError("Image must be a 3-channel RGB image for white balance.")
-    
-    # 复制图像以避免修改原始数据
+
     balanced_image = image_rgb_float.copy()
 
     h, w, _ = image_rgb_float.shape
@@ -183,100 +188,77 @@ def simple_white_balance(image_rgb_float, mask_2d=None):
     G = balanced_image[:, :, 1]
     B = balanced_image[:, :, 2]
 
-    # --- 核心优化：定义一个中心的矩形区域作为白平衡的参考区 ---
-    # 使用图像中心 30%-70% 的区域 (即中心40%x40%的区域)
     y_start, y_end = int(h * 0.3), int(h * 0.7)
     x_start, x_end = int(w * 0.3), int(w * 0.7)
-    
-    # 从原图像中切出中心区域
+
     central_patch_R = R[y_start:y_end, x_start:x_end]
     central_patch_G = G[y_start:y_end, x_start:x_end]
     central_patch_B = B[y_start:y_end, x_start:x_end]
-    
-    # 即使提供了mask，我们也只在中心区域计算，因为这里最可靠
-    # 如果有掩码，也对掩码进行切片，确保我们只在有效区域内计算
+
     if mask_2d is not None:
         central_mask_patch = mask_2d[y_start:y_end, x_start:x_end]
-        # 结合掩码，找到中心区域内真正有效的像素
-        valid_pixels_mask = central_mask_patch > 0.1 # 使用一个小的阈值
-        
-        # 应用掩码到中心区域
+        valid_pixels_mask = central_mask_patch > 0.1
+
         g_channel_valid = central_patch_G[valid_pixels_mask]
-        
-        # 检查有效像素是否存在，以及G通道均值是否过低
+
         if g_channel_valid.size == 0 or np.mean(g_channel_valid) < 1e-6:
             print("Warning: Green channel mean in the central masked area is too low. Skipping white balance.")
-            return image_rgb_float # 返回原始图像
+            return image_rgb_float
 
         avg_R = np.mean(central_patch_R[valid_pixels_mask])
         avg_G = np.mean(g_channel_valid)
         avg_B = np.mean(central_patch_B[valid_pixels_mask])
 
     else:
-        # 如果没有掩码，直接计算中心区域的平均值
         avg_G = np.mean(central_patch_G)
         if avg_G < 1e-6:
             print("Warning: Average Green channel in the central area is too low. Skipping white balance.")
-            return image_rgb_float # 返回原始图
+            return image_rgb_float
         avg_R = np.mean(central_patch_R)
         avg_B = np.mean(central_patch_B)
 
-    # 防止除以零
     if avg_G < 1e-6:
         print("Warning: Average Green channel is too low for white balance. Skipping white balance.")
         return image_rgb_float
-        
-    # 计算增益系数
+
     gain_R = avg_G / (avg_R + 1e-6)
     gain_B = avg_G / (avg_B + 1e-6)
-    
+
     print(f"Robust White Balance Gains (from central patch): R={gain_R:.2f}, G=1.00, B={gain_B:.2f}")
 
-    # 应用增益到整个图像
     balanced_image[:, :, 0] = np.clip(R * gain_R, 0, 1.0)
     balanced_image[:, :, 2] = np.clip(B * gain_B, 0, 1.0)
-    
+
     return balanced_image
 
-# --- 手动选择和调整圆形区域 (修正 'circle_circle' 为 'circle_info') ---
-def get_manual_circle_mask(image_rgb_float, feather_pixels, adjust_step=MANUAL_ADJUST_STEP):
+# --- 【算法升级】手动选择和调整圆形区域, 并记住选择 ---
+def get_manual_circle_mask(image_rgb_float, feather_pixels, output_dir, adjust_step=MANUAL_ADJUST_STEP):
     """
     通过交互式鼠标操作，让用户选择和调整圆形区域，并生成羽化掩码。
-    Args:
-        image_rgb_float (np.array): 用于显示的RGB浮点图像 (0-1)。
-        feather_pixels (int): 掩码羽化的像素宽度。
-        adjust_step (int): 键盘调整步长。
-    Returns:
-        np.array: 羽化后的浮点掩码 (0.0-1.0)。
-        tuple: 最终确定的圆心 (cx, cy) 和半径 r。
+    【功能】加载、预览和复用上次选择的区域，以提高效率。
     """
     h, w, _ = image_rgb_float.shape
-    display_image = (image_rgb_float * 255).astype(np.uint8) # 用于显示的8-bit图像
+    display_image = (image_rgb_float * 255).astype(np.uint8)
 
-    # 将图片缩小到适合屏幕的大小，并保持长宽比
-    max_display_dim = 900 # 例如，最大显示尺寸为900像素
+    max_display_dim = 900
     scale = min(max_display_dim / w, max_display_dim / h)
     display_w, display_h = int(w * scale), int(h * scale)
     display_image_resized = cv2.resize(display_image, (display_w, display_h))
     
-    # 将颜色空间从RGB转换为BGR，因为OpenCV默认是BGR
     display_image_bgr = cv2.cvtColor(display_image_resized, cv2.COLOR_RGB2BGR)
 
+    params_path = os.path.join(output_dir, 'circle_params.npy')
     current_circle = {'center': None, 'radius': 0}
     drawing = False
-    
-    window_name = "Select Fisheye Region (Press 'q' to confirm)"
+    window_name = "Select Fisheye Region (check console for options)"
 
     def draw_circle_on_image(img, circle_info, color=(0, 255, 0), thickness=2):
         temp_img = img.copy()
-        # 修正此行：将 'circle_circle' 改为 'circle_info'
-        if circle_info['center'] is not None and circle_info['radius'] > 0: 
-            # 将缩放后的坐标转换回原始图像坐标
+        if circle_info['center'] is not None and circle_info['radius'] > 0:
             center_x_orig = int(circle_info['center'][0] / scale)
             center_y_orig = int(circle_info['center'][1] / scale)
             radius_orig = int(circle_info['radius'] / scale)
             
-            # 在显示图像上绘制缩放后的圆形
             cv2.circle(temp_img, circle_info['center'], circle_info['radius'], color, thickness)
             cv2.putText(temp_img, f"Center: ({center_x_orig},{center_y_orig})", (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1, cv2.LINE_AA)
             cv2.putText(temp_img, f"Radius: {radius_orig}", (10, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1, cv2.LINE_AA)
@@ -292,7 +274,6 @@ def get_manual_circle_mask(image_rgb_float, feather_pixels, adjust_step=MANUAL_A
         elif event == cv2.EVENT_MOUSEMOVE:
             if drawing:
                 if current_circle['center'] is not None:
-                    # 计算半径
                     dx = x - current_circle['center'][0]
                     dy = y - current_circle['center'][1]
                     current_circle['radius'] = int(np.sqrt(dx*dx + dy*dy))
@@ -304,139 +285,164 @@ def get_manual_circle_mask(image_rgb_float, feather_pixels, adjust_step=MANUAL_A
     cv2.namedWindow(window_name, cv2.WINDOW_AUTOSIZE)
     cv2.setMouseCallback(window_name, mouse_callback)
 
-    print("\n--- Manual Circular Region Selection ---")
-    print("1. Click and drag the mouse to draw a circle (from center to edge).")
-    print("2. Release the mouse button to confirm the initial circle.")
-    print("3. While the window is active, use the keyboard for fine-tuning:")
-    print(f"   'w' / 's': Increase / Decrease Radius (Step: {adjust_step} pixels)")
-    print(f"   'a' / 'd': Move Left / Right Center (Step: {adjust_step} pixels)")
-    print(f"   'z' / 'x': Move Up / Down Center (Step: {adjust_step} pixels)")
-    print("   'r': Reset (start drawing a new circle)")
-    print("   'q': Confirm current circle and continue")
-    print("-------------------------------")
+    # --- 功能：加载、预览和复用逻辑 ---
+    start_main_loop = True
+    if os.path.exists(params_path):
+        print(f"\n--- Found previous selection in '{params_path}' ---")
+        try:
+            loaded_params = np.load(params_path)
+            loaded_center_orig = (int(loaded_params[0]), int(loaded_params[1]))
+            loaded_radius_orig = int(loaded_params[2])
 
-    cv2.imshow(window_name, draw_circle_on_image(display_image_bgr, current_circle))
+            preview_circle = {
+                'center': (int(loaded_center_orig[0] * scale), int(loaded_center_orig[1] * scale)),
+                'radius': int(loaded_radius_orig * scale)
+            }
+            
+            preview_img = draw_circle_on_image(display_image_bgr, preview_circle, color=(0, 255, 255), thickness=2)
+            cv2.putText(preview_img, "(R)euse, (E)dit, or (N)ew selection?", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1, cv2.LINE_AA)
+            cv2.imshow(window_name, preview_img)
+            
+            print("Options:")
+            print(" 'r': Reuse the previous selection.")
+            print(" 'e': Edit the previous selection.")
+            print(" 'n' or any other key: Start a new selection.")
+            
+            key = cv2.waitKey(0) & 0xFF
+            if key == ord('r'):
+                print("Reusing previous selection.")
+                current_circle = preview_circle
+                start_main_loop = False # 直接跳过手动调整循环
+            elif key == ord('e'):
+                print("Editing previous selection.")
+                current_circle = preview_circle # 以加载的圆为起点开始调整
+            else:
+                print("Starting a new selection.")
+        except Exception as e:
+            print(f"Could not load or parse previous selection file. Error: {e}. Starting new selection.")
 
-    key = -1
-    while key != ord('q'):
-        key = cv2.waitKey(1) & 0xFF
+    if start_main_loop:
+        print("\n--- Manual Circular Region Selection ---")
+        print("1. Click and drag the mouse to draw a circle (from center to edge).")
+        print("2. Release the mouse button to confirm the initial circle.")
+        print("3. While the window is active, use the keyboard for fine-tuning:")
+        print(f"   'w' / 's': Increase / Decrease Radius (Step: {adjust_step} pixels)")
+        print(f"   'a' / 'd': Move Left / Right Center (Step: {adjust_step} pixels)")
+        print(f"   'z' / 'x': Move Up / Down Center (Step: {adjust_step} pixels)")
+        print("   'r': Reset (start drawing a new circle)")
+        print("   'q': Confirm current circle and continue")
+        print("-------------------------------")
 
-        if key == ord('w'):
-            current_circle['radius'] += adjust_step
-            cv2.imshow(window_name, draw_circle_on_image(display_image_bgr, current_circle))
-        elif key == ord('s'):
-            current_circle['radius'] = max(0, current_circle['radius'] - adjust_step)
-            cv2.imshow(window_name, draw_circle_on_image(display_image_bgr, current_circle))
-        elif key == ord('a'):
-            if current_circle['center'] is not None:
-                current_circle['center'] = (current_circle['center'][0] - adjust_step, current_circle['center'][1])
-                cv2.imshow(window_name, draw_circle_on_image(display_image_bgr, current_circle))
-        elif key == ord('d'):
-            if current_circle['center'] is not None:
-                current_circle['center'] = (current_circle['center'][0] + adjust_step, current_circle['center'][1])
-                cv2.imshow(window_name, draw_circle_on_image(display_image_bgr, current_circle))
-        elif key == ord('z'):
-            if current_circle['center'] is not None:
-                current_circle['center'] = (current_circle['center'][0], current_circle['center'][1] - adjust_step)
-                cv2.imshow(window_name, draw_circle_on_image(display_image_bgr, current_circle))
-        elif key == ord('x'):
-            if current_circle['center'] is not None:
-                current_circle['center'] = (current_circle['center'][0], current_circle['center'][1] + adjust_step)
-                cv2.imshow(window_name, draw_circle_on_image(display_image_bgr, current_circle))
-        elif key == ord('r'):
-            current_circle = {'center': None, 'radius': 0}
-            drawing = False
-            cv2.imshow(window_name, display_image_bgr.copy())
+        cv2.imshow(window_name, draw_circle_on_image(display_image_bgr, current_circle))
+
+        key = -1
+        while key != ord('q'):
+            key = cv2.waitKey(1) & 0xFF
+
+            if key == ord('w'):
+                current_circle['radius'] += adjust_step
+            elif key == ord('s'):
+                current_circle['radius'] = max(0, current_circle['radius'] - adjust_step)
+            elif key == ord('a'):
+                if current_circle['center'] is not None:
+                    current_circle['center'] = (current_circle['center'][0] - adjust_step, current_circle['center'][1])
+            elif key == ord('d'):
+                if current_circle['center'] is not None:
+                    current_circle['center'] = (current_circle['center'][0] + adjust_step, current_circle['center'][1])
+            elif key == ord('z'):
+                if current_circle['center'] is not None:
+                    current_circle['center'] = (current_circle['center'][0], current_circle['center'][1] - adjust_step)
+            elif key == ord('x'):
+                if current_circle['center'] is not None:
+                    current_circle['center'] = (current_circle['center'][0], current_circle['center'][1] + adjust_step)
+            elif key == ord('r'):
+                current_circle = {'center': None, 'radius': 0}
+                drawing = False
+            
+            if key != ord('q'):
+                 cv2.imshow(window_name, draw_circle_on_image(display_image_bgr, current_circle))
 
     cv2.destroyAllWindows()
-    # 将缩放后的坐标转换回原始图像坐标
+    
     final_cx = int(current_circle['center'][0] / scale) if current_circle['center'] else w // 2
     final_cy = int(current_circle['center'][1] / scale) if current_circle['center'] else h // 2
     final_r = int(current_circle['radius'] / scale) if current_circle['radius'] > 0 else min(h, w) // 2 - 10
 
     if final_r <= 0:
         final_r = 1
+        
+    # --- 功能：保存选择的区域参数 ---
+    try:
+        os.makedirs(output_dir, exist_ok=True)
+        circle_params = np.array([final_cx, final_cy, final_r])
+        np.save(params_path, circle_params)
+        print(f"Saved current circle selection to {params_path}")
+    except Exception as e:
+        print(f"Warning: Could not save circle parameters. Error: {e}")
 
     hard_mask = np.zeros((h, w), dtype=np.uint8)
     cv2.circle(hard_mask, (final_cx, final_cy), final_r, 255, -1)
 
-    # 计算高斯模糊核大小，使其为奇数
-    kernel_size = int(2 * feather_pixels / 3) 
+    kernel_size = int(2 * feather_pixels / 3)
     kernel_size = kernel_size if kernel_size % 2 == 1 else kernel_size + 1
-    if kernel_size < 3: kernel_size = 3 # 最小核大小为3
+    if kernel_size < 3: kernel_size = 3
 
     feathered_mask = cv2.GaussianBlur(hard_mask.astype(np.float32), (kernel_size, kernel_size), 0)
     feathered_mask = feathered_mask / 255.0
-    feathered_mask = np.clip(feathered_mask, 0.0, 1.0) # 确保掩码值在0-1之间
+    feathered_mask = np.clip(feathered_mask, 0.0, 1.0)
 
     return feathered_mask, (final_cx, final_cy, final_r)
 
-# --- 新增函数：绘制和保存热力图 (独立于可视化结果，用于保存每个通道的独立热力图) ---
+
+# --- 新增函数：绘制和保存热力图 ---
 def plot_heatmap_and_save_matrix(matrix, title_suffix, channel_name, grid_rows, grid_cols, raw_path_for_naming, output_base_dir):
     """
     绘制增益矩阵的热力图并保存到文件。
-    动态调整 vmin 和 vmax 以更好地显示通道变化。
     """
-    plt.figure(figsize=(10, 8)) # 稍微大一点的图，便于显示
+    plt.figure(figsize=(10, 8))
     
-    # 寻找非1.0的最小值和最大值，以便更关注衰减区域的变化
-    # 增益通常>=1.0，所以我们关注1.0以上的值
-    actual_values = matrix[matrix != 1.0] # 筛选出非1.0的增益值
+    actual_values = matrix[matrix != 1.0]
     
-    min_display_val = 1.0 
-    max_display_val = MAX_GAIN 
+    min_display_val = 1.0
+    max_display_val = MAX_GAIN
 
     if actual_values.size > 0:
-        min_val_calc = np.min(matrix) # 使用整个矩阵的最小值
-        max_val_calc = np.max(matrix) # 使用整个矩阵的最大值
-
-        # 根据计算出的实际范围调整显示范围
-        # 确保最小值不小于0.1 (增益下限)
-        vmin_plot = max(0.1, min_val_calc * 0.95) 
+        min_val_calc = np.min(matrix)
+        max_val_calc = np.max(matrix)
+        vmin_plot = max(0.1, min_val_calc * 0.95)
         vmax_plot = max_val_calc * 1.05
         
-        # 如果范围太小，强制给定一个有意义的范围
         if abs(vmax_plot - vmin_plot) < 0.01:
             vmin_plot = 1.0
-            vmax_plot = max(1.01, vmax_plot) # 至少有0.01的范围
+            vmax_plot = max(1.01, vmax_plot)
 
         min_display_val = vmin_plot
         max_display_val = vmax_plot
     
-    # 使用 'viridis' 或 'jet' 等颜色映射，通常能更好地显示数值变化
     im = plt.imshow(matrix, cmap='jet', origin='upper', vmin=min_display_val, vmax=max_display_val)
     
-    # 添加文本显示每个单元格的值
     for (j, i), val in np.ndenumerate(matrix):
-        # 根据值在颜色条中的位置动态调整文本颜色
-        # 归一化值到0-1，然后根据颜色映射来决定文本颜色
         normalized_val = (val - min_display_val) / (max_display_val - min_display_val + 1e-6)
-        # 简单判断，如果值在颜色条的亮色区域（通常是值高），用黑色文本；否则用白色文本
-        # 这取决于具体的colormap，对于'jet'，高值是红色/黄色，低值是蓝色。通常高值用黑色文本更清晰。
-        if normalized_val > 0.6: # 阈值可以根据实际效果调整
-            text_color = 'black'
-        else:
-            text_color = 'white'
+        text_color = 'black' if normalized_val > 0.6 else 'white'
         
         plt.text(i, j, f'{val:.2f}', ha='center', va='center', color=text_color, fontsize=8,
-                 bbox=dict(boxstyle="round,pad=0.2", fc="white", ec="none", lw=0.5, alpha=0.6)) # 添加白色背景，提高可读性
+                 bbox=dict(boxstyle="round,pad=0.2", fc="white", ec="none", lw=0.5, alpha=0.6))
     
     cbar = plt.colorbar(im, label='Gain Value')
-    plt.title(f"{channel_name} Channel Gain Map ({title_suffix})") 
-    plt.xlabel('Grid Column') 
-    plt.ylabel('Grid Row') 
-    plt.xticks(np.arange(grid_cols)) 
-    plt.yticks(np.arange(grid_rows)) 
+    plt.title(f"{channel_name} Channel Gain Map ({title_suffix})")
+    plt.xlabel('Grid Column')
+    plt.ylabel('Grid Row')
+    plt.xticks(np.arange(grid_cols))
+    plt.yticks(np.arange(grid_rows))
     
-    # 保存路径
     raw_filename_base = os.path.splitext(os.path.basename(raw_path_for_naming))[0]
     output_dir_heatmaps = os.path.join(output_base_dir, 'heatmaps')
     os.makedirs(output_dir_heatmaps, exist_ok=True)
     
     filename = os.path.join(output_dir_heatmaps, f"{raw_filename_base}_{channel_name}_heatmap.png")
-    plt.savefig(filename, bbox_inches='tight') # bbox_inches='tight' 确保所有内容都被保存
-    plt.close() # 关闭图表，防止在循环中打开过多窗口
-    print(f"已保存 {channel_name} 通道热力图至 {filename}") # 打印内容仍为中文
+    plt.savefig(filename, bbox_inches='tight')
+    plt.close()
+    print(f"已保存 {channel_name} 通道热力图至 {filename}")
 
 def save_gain_matrix_to_txt(matrix, channel_name, raw_path_for_naming, output_base_dir, is_golden=False):
     """将增益矩阵保存为文本文件。"""
@@ -447,13 +453,12 @@ def save_gain_matrix_to_txt(matrix, channel_name, raw_path_for_naming, output_ba
     if is_golden:
         filename = os.path.join(output_dir_matrices, f"{raw_filename_base}_{channel_name}_golden_table_for_tuning.txt")
         header = f"用于Tuning的Golden增益表 (1024 / script_gain) - {channel_name} 通道:"
-        fmt_str = '%d' # 保存为整数
+        fmt_str = '%d'
     else:
         filename = os.path.join(output_dir_matrices, f"{raw_filename_base}_{channel_name}_script_gain.txt")
         header = f"脚本计算出的原始增益 - {channel_name} 通道:"
-        fmt_str = '%.4f' # 保存为浮点数
+        fmt_str = '%.4f'
 
-    # 将矩阵展平并格式化为单行字符串，使用空格分隔
     flat_matrix = matrix.flatten()
     formatted_line = " ".join([fmt_str % num for num in flat_matrix])
 
@@ -463,233 +468,225 @@ def save_gain_matrix_to_txt(matrix, channel_name, raw_path_for_naming, output_ba
 
     print(f"已保存 {header.split('-')[0].strip()} 至: {filename}")
 
-
-# 【新增】增益平滑函数
-def smooth_gain_table(gain_table, kernel_size=3):
+# 【算法升级】平滑函数，增加中值滤波来消除尖锐的噪声脉冲
+def smooth_table(table, median_ksize=3, gaussian_ksize=3):
     """
-    对增益矩阵进行平滑处理以消除异常值。
+    对矩阵进行平滑处理。
+    先使用中值滤波消除孤立的尖锐脉冲噪声，然后使用高斯模糊进行整体平滑。
     Args:
-        gain_table (np.array): 原始增益矩阵。
-        kernel_size (int): 高斯模糊的核大小，必须为奇数。
+        table (np.array): 输入的增益矩阵。
+        median_ksize (int): 中值滤波的内核大小，必须是奇数。
+        gaussian_ksize (int): 高斯模糊的内核大小，必须是奇数。
     Returns:
-        np.array: 平滑后的增益矩阵。
+        np.array: 平滑后的矩阵。
     """
-    if kernel_size % 2 == 0:
-        kernel_size += 1 # 确保核大小为奇数
-    # 使用高斯模糊进行平滑
-    smoothed_table = cv2.GaussianBlur(gain_table, (kernel_size, kernel_size), 0)
+    # 确保内核大小是奇数
+    if median_ksize % 2 == 0:
+        median_ksize += 1
+    if gaussian_ksize % 2 == 0:
+        gaussian_ksize += 1
+    
+    # 中值滤波要求数据类型是 float32
+    table_float32 = table.astype(np.float32)
+    
+    # 步骤1: 使用中值滤波，可以极其有效地去除热力图上那种“孤立亮斑”噪声
+    denoised_table = cv2.medianBlur(table_float32, median_ksize)
+    
+    # 步骤2: 之后再使用高斯模糊，对整体进行平滑，使过渡更自然
+    smoothed_table = cv2.GaussianBlur(denoised_table, (gaussian_ksize, gaussian_ksize), 0)
+    
     return smoothed_table
 
-# 【新增】增益对称化函数
-def symmetrize_gain_table(gain_table):
+
+# 【新增】对称化函数
+def symmetrize_table(table):
     """
-    通过取对称点平均值的方式，强制使增益矩阵中心对称。
-    Args:
-        gain_table (np.array): 原始增益矩阵。
-    Returns:
-        np.array: 对称化处理后的增益矩阵。
+    通过取对称点平均值的方式，强制使矩阵中心对称。
     """
-    rows, cols = gain_table.shape
-    symmetrized_table = gain_table.copy()
+    rows, cols = table.shape
+    symmetrized_table = table.copy()
     
-    # 仅需遍历一半的表格即可
     for r in range((rows + 1) // 2):
         for c in range(cols):
-            # 找到对称点
             sym_r = rows - 1 - r
             sym_c = cols - 1 - c
-            
-            # 计算对称点的平均值
             avg_val = (symmetrized_table[r, c] + symmetrized_table[sym_r, sym_c]) / 2.0
-            
-            # 将平均值赋给对称点
             symmetrized_table[r, c] = avg_val
             symmetrized_table[sym_r, sym_c] = avg_val
             
     return symmetrized_table
 
-# --- 核心校准函数 (主要修改：拜耳数据转换为8-bit用于显示时进行10-bit归一化) ---
-def perform_brightness_compensation_with_circle_mask(raw_img_path, width, height, bayer_pattern, 
-                                                    grid_rows, grid_cols, 
-                                                    feather_pixels=100, max_gain=4.0,
-                                                    valid_grid_threshold_ratio=0.05,
-                                                    falloff_factor=0.85,
-                                                    use_manual_selection=True):
-    print(f"--- 开始亮度补偿处理：{os.path.basename(raw_img_path)} ---")
-    print(f"图像尺寸: {width}x{height}, 网格大小: {grid_rows}x{grid_cols}")
+# 【新增】径向衰减图生成函数
+def create_falloff_map(rows, cols, falloff_at_edge):
+    """
+    创建一个从中心到边缘线性变化的衰减因子地图。
+    """
+    center_r, center_c = (rows - 1) / 2.0, (cols - 1) / 2.0
+    max_dist = np.sqrt(center_r**2 + center_c**2)
     
-    # 读取 RAW 数据
+    falloff_map = np.ones((rows, cols), dtype=np.float32)
+    
+    for r in range(rows):
+        for c in range(cols):
+            dist = np.sqrt((r - center_r)**2 + (c - center_c)**2)
+            ratio = dist / max_dist
+            falloff_map[r, c] = 1.0 * (1 - ratio) + falloff_at_edge * ratio
+            
+    return falloff_map
+
+# --- 【算法升级】核心校准函数，使用固定中心点 ---
+# --- 【V3 - 逻辑重构】核心校准函数 ---
+def perform_lsc_calibration(raw_img_path, width, height, bayer_pattern,
+                            grid_rows, grid_cols,
+                            black_levels_dict,
+                            output_dir,
+                            feather_pixels=100, max_gain=4.0,
+                            valid_grid_threshold_ratio=0.2,
+                            falloff_factor=1.0, # Luma falloff
+                            color_falloff_factor=1.0, # Chroma falloff
+                            use_manual_selection=True):
+    print(f"--- 开始LSC标定，生成平台增益表：{os.path.basename(raw_img_path)} ---")
+    print(f"图像尺寸: {width}x{height}, 网格大小: {grid_rows}x{grid_cols}, 黑电平: {black_levels_dict}")
+    
     original_bayer_16bit = read_raw_bayer_image_manual(raw_img_path, width, height)
-    if original_bayer_16bit is None:
-        print("错误：无法读取RAW图像。")
-        return None, None, None, None
-
+    if original_bayer_16bit is None: return None, None, None, None
     h, w = original_bayer_16bit.shape
-    original_bayer_8bit_for_display = (original_bayer_16bit * (255.0 / 1023.0)).astype(np.uint8)
-    original_rgb_float_no_wb = cv2.cvtColor(original_bayer_8bit_for_display, bayer_pattern).astype(np.float32) / 255.0
-    temp_display_img_for_selection = simple_white_balance(original_rgb_float_no_wb)
 
+    # 1. 【核心修改】首先，创建全局的、去除黑电平后的bayer数据
+    bl_map = np.zeros_like(original_bayer_16bit, dtype=np.float32)
+    if bayer_pattern == cv2.COLOR_BayerGR2BGR_VNG: # GRBG
+        bl_map[0::2, 0::2] = black_levels_dict['Gr']
+        bl_map[0::2, 1::2] = black_levels_dict['R']
+        bl_map[1::2, 0::2] = black_levels_dict['B']
+        bl_map[1::2, 1::2] = black_levels_dict['Gb']
+    # ... 其他bayer pattern的逻辑 ...
+    else: raise ValueError(f"BLC Map creation not implemented for this Bayer Pattern: {bayer_pattern}")
+    
+    # 得到“纯净信号”的浮点bayer图
+    bayer_blc_float = np.maximum(0, original_bayer_16bit.astype(np.float32) - bl_map)
+
+    # 2. 准备预览图 (此部分逻辑不变)
+    avg_bl = (black_levels_dict['Gr'] + black_levels_dict['Gb']) / 2.0
+    preview_bayer_8bit = (np.maximum(0, original_bayer_16bit.astype(np.float32) - avg_bl) * (255.0 / (1023.0 - avg_bl))).astype(np.uint8)
+    original_rgb_float_no_wb = cv2.cvtColor(preview_bayer_8bit, bayer_pattern).astype(np.float32) / 255.0
     if use_manual_selection:
-        feathered_mask_2d, detected_circle_info = get_manual_circle_mask(temp_display_img_for_selection, feather_pixels, MANUAL_ADJUST_STEP)
+        temp_display_img_for_selection = simple_white_balance(original_rgb_float_no_wb.copy())
+        feathered_mask_2d, detected_circle_info = get_manual_circle_mask(temp_display_img_for_selection, feather_pixels, output_dir, MANUAL_ADJUST_STEP)
         print(f"手动选择已确认: 圆心=({detected_circle_info[0]},{detected_circle_info[1]}), 半径={detected_circle_info[2]}")
-    else:
-        print("自动霍夫圆检测未在此版本中实现新的拜耳流程。")
-        return None, None, None, None
+    else: return None, None, None, None
 
-    feathered_mask_3ch = np.stack([feathered_mask_2d] * 3, axis=-1)
-    bayer_channels_float = extract_bayer_channels(original_bayer_16bit, bayer_pattern)
-
-   # 根据新的网格行数和列数计算每个网格单元的像素高度和宽度
-    # 确保每个网格单元至少有一个像素
+    # 3. 计算增益 (输入的是已经去除黑电平的数据)
+    bayer_channels_float = extract_bayer_channels(bayer_blc_float, bayer_pattern)
+    
+    # ... (从这里开始到 final_gain_matrices 计算结束的所有代码，都使用您上一轮已经修改好的、包含“终极修正”的版本) ...
     H_grid_cell_size = h // grid_rows
     W_grid_cell_size = w // grid_cols
     H_grid_cell_size = max(H_grid_cell_size, 1)
     W_grid_cell_size = max(W_grid_cell_size, 1)
-
     grid_brightness_maps = {ch: np.zeros((grid_rows, grid_cols), dtype=np.float32) for ch in ['R', 'Gr', 'Gb', 'B']}
     epsilon = 1e-6
-    
     for ch_name, channel_data_sparse in bayer_channels_float.items():
-        for i in range(grid_rows): # 遍历行
-            for j in range(grid_cols): # 遍历列
-                y_start = i * H_grid_cell_size
-                y_end = min((i + 1) * H_grid_cell_size, h)
-                x_start = j * W_grid_cell_size
-                x_end = min((j + 1) * W_grid_cell_size, w)
-
+        for i in range(grid_rows):
+            for j in range(grid_cols):
+                y_start, y_end = i * H_grid_cell_size, (i + 1) * H_grid_cell_size
+                x_start, x_end = j * W_grid_cell_size, (j + 1) * W_grid_cell_size
                 grid_area_channel = channel_data_sparse[y_start:y_end, x_start:x_end]
                 mask_area = feathered_mask_2d[y_start:y_end, x_start:x_end]
                 valid_pixels = (grid_area_channel > epsilon) & (mask_area > epsilon)
-
                 if np.any(valid_pixels):
                     grid_brightness_maps[ch_name][i, j] = np.sum(grid_area_channel[valid_pixels] * mask_area[valid_pixels]) / (np.sum(mask_area[valid_pixels]) + epsilon)
                 else:
                     grid_brightness_maps[ch_name][i, j] = 0.0
 
-    # --- 【最终优化算法 V14】: G通道优先 + 衰减因子 + 平滑 + 对称 ---
-    # 最终确认：该算法旨在生成能同时校正Luma和Chroma，且不引入色偏的LSC表。
-    print("\n--- 开始使用“G通道优先 + 衰减因子 + 平滑 + 对称”算法计算增益 (V14) ---")
+    print("\n--- 开始使用最终精细算法计算增益 (V15.5) ---")
+    G_avg_map = (grid_brightness_maps['Gr'] + grid_brightness_maps['Gb']) / 2.0
+    R_map, B_map = grid_brightness_maps['R'], grid_brightness_maps['B']
+    if np.max(G_avg_map) < epsilon:
+        print("错误：图像完全黑暗，无法进行LSC计算。")
+        return None, None, None, None
     center_row_idx = grid_rows // 2
     center_col_idx = grid_cols // 2
-
-    # 1. 计算理论增益
-    G_avg_map = (grid_brightness_maps['Gr'] + grid_brightness_maps['Gb']) / 2.0
-    R_map = grid_brightness_maps['R']
-    B_map = grid_brightness_maps['B']
-    
+    print(f"使用固定的几何中心点: (row={center_row_idx}, col={center_col_idx}) 作为参考点。")
     center_G_avg = G_avg_map[center_row_idx, center_col_idx]
-    center_R = R_map[center_row_idx, center_col_idx]
-    center_B = B_map[center_row_idx, center_col_idx]
-
+    center_R, center_B = R_map[center_row_idx, center_col_idx], B_map[center_row_idx, center_col_idx]
     if center_G_avg < epsilon:
         print("错误：中心区域G通道亮度过低，无法进行LSC计算。")
         return None, None, None, None
-
-    # Luma gain
-    gain_G_raw = np.where(G_avg_map > epsilon, center_G_avg / G_avg_map, 1.0)
-    
-    # Chroma gain
+    validity_threshold = center_G_avg * valid_grid_threshold_ratio
+    master_valid_mask = G_avg_map > validity_threshold
+    print(f"Center G-luma: {center_G_avg:.4f}, Validity threshold: {validity_threshold:.4f}. Valid grids: {np.sum(master_valid_mask)}/{master_valid_mask.size}")
     target_ratio_R_G = center_R / (center_G_avg + epsilon)
     target_ratio_B_G = center_B / (center_G_avg + epsilon)
-    print(f"中心点目标颜色比例: R/G={target_ratio_R_G:.4f}, B/G={target_ratio_B_G:.4f}")
-
-    current_ratio_R_G = np.where(G_avg_map > epsilon, R_map / G_avg_map, 0)
-    gain_R_correction = np.where(current_ratio_R_G > epsilon, target_ratio_R_G / current_ratio_R_G, 1.0)
-    gain_R_raw = gain_G_raw * gain_R_correction
-
-    current_ratio_B_G = np.where(G_avg_map > epsilon, B_map / G_avg_map, 0)
-    gain_B_correction = np.where(current_ratio_B_G > epsilon, target_ratio_B_G / current_ratio_B_G, 1.0)
-    gain_B_raw = gain_G_raw * gain_B_correction
-
-    # 2. 应用衰减因子
-    print(f"应用衰减因子: {falloff_factor}")
-    gain_R_falloff = np.power(gain_R_raw, falloff_factor)
-    gain_G_falloff = np.power(gain_G_raw, falloff_factor) # G通道也需要应用
-    gain_B_falloff = np.power(gain_B_raw, falloff_factor)
-    
-    # 3. 平滑处理
-    print("对理论增益进行平滑处理...")
-    gain_R_smoothed = smooth_gain_table(gain_R_falloff)
-    gain_G_smoothed = smooth_gain_table(gain_G_falloff)
-    gain_B_smoothed = smooth_gain_table(gain_B_falloff)
-    
-    # 4. 对称化处理
-    print("对平滑后的增益进行对称化处理...")
-    gain_R_sym = symmetrize_gain_table(gain_R_smoothed)
-    gain_G_sym = symmetrize_gain_table(gain_G_smoothed)
-    gain_B_sym = symmetrize_gain_table(gain_B_smoothed)
-
-    # 5. 有效性质询
-    validity_threshold = center_G_avg * valid_grid_threshold_ratio
-    print(f"中心G通道平均亮度: {center_G_avg:.4f}, 有效性质询门槛: {validity_threshold:.4f}")
-    master_valid_mask = G_avg_map > validity_threshold
-
-    # 6. 应用有效性掩码
-    gain_R_sym[~master_valid_mask] = 1.0
-    gain_G_sym[~master_valid_mask] = 1.0
-    gain_B_sym[~master_valid_mask] = 1.0
-    
-    # 7. 最终裁剪
-    script_gain_matrices = {
-        'R': np.clip(gain_R_sym, 1.0, max_gain),
-        'Gr': np.clip(gain_G_sym, 1.0, max_gain),
-        'Gb': np.clip(gain_G_sym, 1.0, max_gain),
-        'B': np.clip(gain_B_sym, 1.0, max_gain)
+    current_ratio_R_G = np.where(master_valid_mask, R_map / (G_avg_map + epsilon), 1.0)
+    ratio_correction_R = np.where(current_ratio_R_G > epsilon, target_ratio_R_G / current_ratio_R_G, 1.0)
+    current_ratio_B_G = np.where(master_valid_mask, B_map / (G_avg_map + epsilon), 1.0)
+    ratio_correction_B = np.where(current_ratio_B_G > epsilon, target_ratio_B_G / current_ratio_B_G, 1.0)
+    ratio_correction_R_processed = smooth_table(ratio_correction_R)
+    ratio_correction_B_processed = smooth_table(ratio_correction_B)
+    if APPLY_SYMMETRY:
+        ratio_correction_R_processed = symmetrize_table(ratio_correction_R_processed)
+        ratio_correction_B_processed = symmetrize_table(ratio_correction_B_processed)
+    print("Normalizing smoothed color correction tables to enforce center ratio = 1.0")
+    center_ratio_R = ratio_correction_R_processed[center_row_idx, center_col_idx]
+    center_ratio_B = ratio_correction_B_processed[center_row_idx, center_col_idx]
+    if abs(center_ratio_R) > 1e-6: ratio_correction_R_processed /= center_ratio_R
+    else: ratio_correction_R_processed.fill(1.0)
+    if abs(center_ratio_B) > 1e-6: ratio_correction_B_processed /= center_ratio_B
+    else: ratio_correction_B_processed.fill(1.0)
+    gain_G_raw = np.where(G_avg_map > epsilon, center_G_avg / G_avg_map, 1.0)
+    luma_falloff_map = create_falloff_map(grid_rows, grid_cols, falloff_factor)
+    gain_G_falloff = np.power(gain_G_raw, luma_falloff_map)
+    gain_G_smoothed = smooth_table(gain_G_falloff)
+    final_gain_G = gain_G_smoothed
+    if APPLY_SYMMETRY: final_gain_G = symmetrize_table(final_gain_G)
+    print(f"Creating aggressive color falloff map, edge factor: {color_falloff_factor}")
+    color_falloff_map = create_falloff_map(grid_rows, grid_cols, color_falloff_factor)
+    final_gain_R = final_gain_G * (1.0 + (ratio_correction_R_processed - 1.0) * color_falloff_map)
+    final_gain_B = final_gain_G * (1.0 + (ratio_correction_B_processed - 1.0) * color_falloff_map)
+    final_gain_R[~master_valid_mask] = 1.0
+    final_gain_G[~master_valid_mask] = 1.0
+    final_gain_B[~master_valid_mask] = 1.0
+    final_gain_matrices = {
+        'R': np.clip(final_gain_R, 1.0, max_gain),
+        'Gr': np.clip(final_gain_G, 1.0, max_gain),
+        'Gb': np.clip(final_gain_G, 1.0, max_gain),
+        'B': np.clip(final_gain_B, 1.0, max_gain)
     }
-    print("已使用“G通道优先 + 衰减因子 + 平滑 + 对称”机制计算脚本增益矩阵。")
+    
+    # 4. 【核心修改】将增益应用到去除黑电平后的数据上
+    gain_map_R_full = cv2.resize(final_gain_matrices['R'], (w, h), interpolation=cv2.INTER_LINEAR)
+    gain_map_Gr_full = cv2.resize(final_gain_matrices['Gr'], (w, h), interpolation=cv2.INTER_LINEAR)
+    gain_map_Gb_full = cv2.resize(final_gain_matrices['Gb'], (w, h), interpolation=cv2.INTER_LINEAR)
+    gain_map_B_full = cv2.resize(final_gain_matrices['B'], (w, h), interpolation=cv2.INTER_LINEAR)
 
-
-    # --- 保存和可视化增益矩阵 ---
-    for ch_name, gain in script_gain_matrices.items():
-        # 保存脚本计算出的原始增益
-        save_gain_matrix_to_txt(gain, ch_name, raw_img_path, OUTPUT_DIR, is_golden=False)
-        
-        # 调用热力图生成函数
-        plot_heatmap_and_save_matrix(gain, "Script Gain (V14)", ch_name, grid_rows, grid_cols, raw_img_path, OUTPUT_DIR)
-
-        # 计算并保存用于Tuning的Golden增益表
-        golden_table = 1024 / (gain + epsilon)
-        save_gain_matrix_to_txt(golden_table, ch_name, raw_img_path, OUTPUT_DIR, is_golden=True)
-
-    # 为了可视化，我们仍然使用脚本增益进行补偿
-    gain_map_R_full = cv2.resize(script_gain_matrices['R'], (w, h), interpolation=cv2.INTER_LINEAR)
-    gain_map_Gr_full = cv2.resize(script_gain_matrices['Gr'], (w, h), interpolation=cv2.INTER_LINEAR)
-    gain_map_Gb_full = cv2.resize(script_gain_matrices['Gb'], (w, h), interpolation=cv2.INTER_LINEAR)
-    gain_map_B_full = cv2.resize(script_gain_matrices['B'], (w, h), interpolation=cv2.INTER_LINEAR)
-
-    compensated_bayer_16bit = apply_gain_to_bayer(
-        original_bayer_16bit, 
-        gain_map_R_full, gain_map_Gr_full, gain_map_Gb_full, gain_map_B_full, 
+    compensated_bayer_blc_float = apply_gain_to_bayer(
+        bayer_blc_float, # <--- 使用去除黑电平后的数据
+        gain_map_R_full, gain_map_Gr_full, gain_map_Gb_full, gain_map_B_full,
         bayer_pattern
     )
-
-    compensated_bayer_8bit = (compensated_bayer_16bit * (255.0 / 1023.0)).astype(np.uint8)
+    
+    # 5. 可视化和保存
+    # 注意：compensated_bayer_blc_float已经是纯信号，不需要再减黑电平
+    compensated_bayer_8bit = (np.clip(compensated_bayer_blc_float, 0, 1023-avg_bl) * (255.0 / (1023.0-avg_bl))).astype(np.uint8)
     compensated_rgb_float = cv2.cvtColor(compensated_bayer_8bit, bayer_pattern).astype(np.float32) / 255.0
-    compensated_rgb_float = compensated_rgb_float * feathered_mask_3ch
+    compensated_rgb_float = compensated_rgb_float * np.stack([feathered_mask_2d] * 3, axis=-1)
     compensated_rgb_float = np.clip(compensated_rgb_float, 0.0, 1.0)
-
-    original_rgb_float_wb = simple_white_balance(original_rgb_float_no_wb, mask_2d=feathered_mask_2d)
+    
+    original_rgb_float_wb = simple_white_balance(original_rgb_float_no_wb.copy(), mask_2d=feathered_mask_2d)
     compensated_rgb_float_wb = simple_white_balance(compensated_rgb_float, mask_2d=feathered_mask_2d)
 
-    print("--- 亮度补偿处理完成 ---")
-    return original_rgb_float_wb, compensated_rgb_float_wb, original_rgb_float_no_wb, script_gain_matrices
+    return original_rgb_float_wb, compensated_rgb_float_wb, original_rgb_float_no_wb, final_gain_matrices
 
 
-def visualize_results_circle_mask(original_img_wb, compensated_img_wb, original_img_no_wb, gain_data_full_size, output_dir='.'):
+# 【恢复】可视化函数
+def visualize_results_circle_mask(original_img_wb, compensated_img_wb, original_img_no_wb, final_gain_matrices, output_dir='.'):
     """
     可视化原始图像（白平衡后）、补偿图像（白平衡后）、直方图以及各通道的增益热力图。
-    新增：原始未LSC但白平衡的图 vs 做了LSC校正并白平衡的图 对比。
-    Args:
-        original_img_wb (np.array): 原始去马赛克且白平衡后的RGB图像 (float, 0-1)。
-        compensated_img_wb (np.array): LSC补偿且白平衡后的RGB图像 (float, 0-1)。
-        original_img_no_wb (np.array): 原始去马赛克但未白平衡的RGB图像 (float, 0-1)。
-        gain_data_full_size (dict): 包含R, Gr, Gb, B通道完整尺寸增益图的字典。
-        output_dir (str): 输出目录。
     """
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
 
-    img_name = os.path.basename(RAW_IMAGE_PATH).split('.')[0]
+    img_name = os.path.splitext(os.path.basename(RAW_IMAGE_PATH))[0]
     output_images_dir = os.path.join(output_dir, 'visualizations')
     os.makedirs(output_images_dir, exist_ok=True)
 
@@ -697,56 +694,79 @@ def visualize_results_circle_mask(original_img_wb, compensated_img_wb, original_
     plt.figure(figsize=(18, 6))
     plt.subplot(1, 3, 1)
     plt.imshow(original_img_no_wb)
-    plt.title('Original Image (Demosaiced, No WB)') 
+    plt.title('Original Image (Demosaiced, No WB)')
     plt.axis('off')
 
     plt.subplot(1, 3, 2)
     plt.imshow(original_img_wb)
-    plt.title('Original Image (Demosaiced, with WB)') 
+    plt.title('Original Image (Demosaiced, with WB)')
     plt.axis('off')
 
     plt.subplot(1, 3, 3)
     plt.imshow(compensated_img_wb)
-    plt.title('Compensated Image (LSC + WB, Feathered Mask)') 
+    plt.title('Compensated Image (LSC + WB, Feathered Mask)')
     plt.axis('off')
-    plt.suptitle('Image Correction: Original vs. LSC Corrected') 
+    plt.suptitle('Image Correction: Original vs. LSC Corrected')
     plt.savefig(os.path.join(output_images_dir, f'{img_name}_brightness_compare_all.png'), bbox_inches='tight')
     plt.show()
 
     # 2. 亮度直方图对比
     plt.figure(figsize=(15, 5))
-    bins = 100 
+    bins = 100
     
     plt.subplot(1, 3, 1)
-    # 只绘制有效区域的直方图
     valid_original_pixels_no_wb = original_img_no_wb[original_img_no_wb > 0]
-    plt.hist(valid_original_pixels_no_wb.flatten(), bins=bins, color='gray', alpha=0.7, label='All Channels') # 修改为英文
-    plt.title('Original Image Brightness (No WB)') 
-    plt.xlabel('Normalized Brightness') 
+    plt.hist(valid_original_pixels_no_wb.flatten(), bins=bins, color='gray', alpha=0.7, label='All Channels')
+    plt.title('Original Image Brightness (No WB)')
+    plt.xlabel('Normalized Brightness')
     plt.ylabel('Pixel Count')
     plt.legend()
 
     plt.subplot(1, 3, 2)
     valid_original_pixels_wb = original_img_wb[original_img_wb > 0]
-    plt.hist(valid_original_pixels_wb.flatten(), bins=bins, color='gray', alpha=0.7, label='All Channels') # 修改为英文
-    plt.title('Original Image Brightness (with WB)') 
-    plt.xlabel('Normalized Brightness') 
-    plt.ylabel('Pixel Count') 
-    plt.legend()
-
-    plt.subplot(1, 3, 3)
-    # 只绘制有效区域的直方图
-    valid_compensated_pixels_wb = compensated_img_wb[compensated_img_wb > 0]
-    plt.hist(valid_compensated_pixels_wb.flatten(), bins=bins, color='gray', alpha=0.7, label='All Channels') # 修改为英文
-    plt.title('Compensated Image Brightness (LSC + WB)') 
+    plt.hist(valid_original_pixels_wb.flatten(), bins=bins, color='gray', alpha=0.7, label='All Channels')
+    plt.title('Original Image Brightness (with WB)')
     plt.xlabel('Normalized Brightness')
     plt.ylabel('Pixel Count')
     plt.legend()
-    plt.suptitle('Brightness Distribution Histograms') 
+
+    plt.subplot(1, 3, 3)
+    valid_compensated_pixels_wb = compensated_img_wb[compensated_img_wb > 0]
+    plt.hist(valid_compensated_pixels_wb.flatten(), bins=bins, color='gray', alpha=0.7, label='All Channels')
+    plt.title('Compensated Image Brightness (LSC + WB)')
+    plt.xlabel('Normalized Brightness')
+    plt.ylabel('Pixel Count')
+    plt.legend()
+    plt.suptitle('Brightness Distribution Histograms')
     plt.savefig(os.path.join(output_images_dir, f'{img_name}_brightness_histograms_all.png'), bbox_inches='tight')
     plt.show()
 
-    # 3. 单通道增益热力图 (使用完整尺寸的增益图进行可视化) - 此部分已由 plot_heatmap_and_save_matrix 处理
+# 【恢复】新增LSC校准前后对比图函数
+def save_comparison_image(before_img_wb, after_img_wb, output_path):
+    """
+    将校准前后的图像并排放在一起并保存。
+    """
+    before_8bit = (np.clip(before_img_wb, 0, 1) * 255).astype(np.uint8)
+    after_8bit = (np.clip(after_img_wb, 0, 1) * 255).astype(np.uint8)
+
+    if before_8bit.shape != after_8bit.shape:
+        print("Warning: Before and after images have different shapes. Cannot create comparison image.")
+        return
+
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    font_scale = 1
+    font_color = (0, 0, 255) # Red
+    thickness = 2
+    
+    cv2.putText(before_8bit, 'Before LSC', (20, 50), font, font_scale, font_color, thickness, cv2.LINE_AA)
+    cv2.putText(after_8bit, 'After LSC', (20, 50), font, font_scale, font_color, thickness, cv2.LINE_AA)
+
+    comparison_img = np.hstack((before_8bit, after_8bit))
+    
+    comparison_img_bgr = cv2.cvtColor(comparison_img, cv2.COLOR_RGB2BGR)
+
+    cv2.imwrite(output_path, comparison_img_bgr)
+    print(f"LSC校准前后对比图已保存至: {output_path}")
 
 # --- 主程序 ---
 if __name__ == '__main__':
@@ -755,16 +775,16 @@ if __name__ == '__main__':
     # 确保输出目录存在
     if not os.path.exists(OUTPUT_DIR):
         os.makedirs(OUTPUT_DIR)
-        print(f"已创建输出目录: {OUTPUT_DIR}") 
+        print(f"已创建输出目录: {OUTPUT_DIR}")
 
     # 确保RAW文件所在的目录存在
     if os.path.dirname(RAW_IMAGE_PATH) and not os.path.exists(os.path.dirname(RAW_IMAGE_PATH)):
         os.makedirs(os.path.dirname(RAW_IMAGE_PATH))
-        print(f"已创建RAW图像目录: {os.path.dirname(RAW_IMAGE_PATH)}。请将您的RAW图像放置于此。") 
+        print(f"已创建RAW图像目录: {os.path.dirname(RAW_IMAGE_PATH)}。请将您的RAW图像放置于此。")
     
     # 如果RAW文件不存在，创建一个虚拟文件用于测试
     if not os.path.exists(RAW_IMAGE_PATH):
-        print(f"\n--- 注意：RAW文件 '{RAW_IMAGE_PATH}' 不存在。正在创建虚拟RAW文件用于测试 ---") 
+        print(f"\n--- 注意：RAW文件 '{RAW_IMAGE_PATH}' 不存在。正在创建虚拟RAW文件用于测试 ---")
         dummy_data = np.zeros((IMAGE_HEIGHT, IMAGE_WIDTH), dtype=np.uint16)
         
         # 模拟亮度衰减 (中心亮，边缘暗)
@@ -788,49 +808,48 @@ if __name__ == '__main__':
 
         dummy_data.tofile(RAW_IMAGE_PATH)
         print(f"已创建一个虚拟RAW文件用于测试: {RAW_IMAGE_PATH}")
-        print("--- 虚拟RAW文件创建完毕 ---") 
+        print("--- 虚拟RAW文件创建完毕 ---")
 
     # 执行亮度补偿主函数
-    original_rgb_for_display_wb, compensated_rgb_final_wb, original_rgb_for_display_no_wb, script_gain_matrices = \
-        perform_brightness_compensation_with_circle_mask(
-            RAW_IMAGE_PATH, IMAGE_WIDTH, IMAGE_HEIGHT, BAYER_PATTERN,
-            grid_rows=GRID_ROWS,
-            grid_cols=GRID_COLS,
-            feather_pixels=MASK_FEATHER_PIXELS,
-            max_gain=MAX_GAIN,
-            valid_grid_threshold_ratio=VALID_GRID_THRESHOLD_RATIO,
-            falloff_factor=FALLOFF_FACTOR,
-            use_manual_selection=USE_MANUAL_CIRCLE_SELECTION
-        )
+    result = perform_lsc_calibration(
+        RAW_IMAGE_PATH, IMAGE_WIDTH, IMAGE_HEIGHT, BAYER_PATTERN,
+        grid_rows=GRID_ROWS,
+        grid_cols=GRID_COLS,
+        black_levels_dict=BLACK_LEVELS, # 传入黑电平
+        output_dir=OUTPUT_DIR, # 传入输出目录
+        feather_pixels=MASK_FEATHER_PIXELS,
+        max_gain=MAX_GAIN,
+        valid_grid_threshold_ratio=VALID_GRID_THRESHOLD_RATIO,
+        falloff_factor=FALLOFF_FACTOR,
+        use_manual_selection=USE_MANUAL_CIRCLE_SELECTION
+    )
 
-    if original_rgb_for_display_wb is not None:
-        base_filename = os.path.basename(RAW_IMAGE_PATH).split('.')[0]
+    if result is not None:
+        original_rgb_float_wb, compensated_rgb_final_wb, original_rgb_float_no_wb, final_gain_matrices = result
         
-        # 保存白平衡且LSC补偿后的PNG图像
+        base_filename = os.path.splitext(os.path.basename(RAW_IMAGE_PATH))[0]
+        
+        # 【恢复】保存各种PNG图像
         compensated_img_8bit_wb = (compensated_rgb_final_wb * 255).astype(np.uint8)
         output_image_path_wb = os.path.join(OUTPUT_DIR, f'{base_filename}_compensated_feathered_mask_4ch_WB.png')
         cv2.imwrite(output_image_path_wb, cv2.cvtColor(compensated_img_8bit_wb, cv2.COLOR_RGB2BGR))
-        print(f"补偿后且白平衡的图像已保存至: {output_image_path_wb}") 
+        print(f"补偿后且白平衡的图像已保存至: {output_image_path_wb}")
 
-        # 保存原始去马赛克且白平衡后的PNG图像 (用于对比)
-        original_img_8bit_wb = (original_rgb_for_display_wb * 255).astype(np.uint8)
+        original_img_8bit_wb = (original_rgb_float_wb * 255).astype(np.uint8)
         original_output_path_wb = os.path.join(OUTPUT_DIR, f'{base_filename}_original_dem_WB.png')
         cv2.imwrite(original_output_path_wb, cv2.cvtColor(original_img_8bit_wb, cv2.COLOR_RGB2BGR))
-        print(f"原始去马赛克且白平衡图像已保存至: {original_output_path_wb}") 
+        print(f"原始去马赛克且白平衡图像已保存至: {original_output_path_wb}")
 
-        # 保存原始去马赛克但未白平衡的PNG图像 (用于对比最初的绿色图像)
-        original_img_8bit_no_wb = (original_rgb_for_display_no_wb * 255).astype(np.uint8)
+        original_img_8bit_no_wb = (original_rgb_float_no_wb * 255).astype(np.uint8)
         original_output_path_no_wb = os.path.join(OUTPUT_DIR, f'{base_filename}_original_dem_NoWB.png')
         cv2.imwrite(original_output_path_no_wb, cv2.cvtColor(original_img_8bit_no_wb, cv2.COLOR_RGB2BGR))
-        print(f"原始去马赛克但未白平衡图像已保存至: {original_output_path_no_wb}") 
+        print(f"原始去马赛克但未白平衡图像已保存至: {original_output_path_no_wb}")
+        
+        # 【恢复】调用新增的对比图保存函数
+        comparison_path = os.path.join(OUTPUT_DIR, 'visualizations', f'{base_filename}_lsc_before_vs_after.png')
+        save_comparison_image(original_rgb_float_wb, compensated_rgb_final_wb, comparison_path)
 
-        npz_output_path = os.path.join(OUTPUT_DIR, f'{base_filename}_gain_maps_full_size.npz')
-        np.savez(npz_output_path,
-                 R=script_gain_matrices['R'], 
-                 Gr=script_gain_matrices['Gr'], 
-                 Gb=script_gain_matrices['Gb'], 
-                 B=script_gain_matrices['B'])
-        print(f"增益图 (完整尺寸) 已保存至: {npz_output_path}") 
-        visualize_results_circle_mask(original_rgb_for_display_wb, compensated_rgb_final_wb, original_rgb_for_display_no_wb, script_gain_matrices, OUTPUT_DIR)
+        # 【恢复】调用完整的可视化函数
+        visualize_results_circle_mask(original_rgb_float_wb, compensated_rgb_final_wb, original_rgb_float_no_wb, final_gain_matrices, OUTPUT_DIR)
     else:
         print("补偿过程失败。请检查之前的错误信息。")
