@@ -110,8 +110,10 @@ def extract_bayer_channels(bayer_blc_float, bayer_pattern_code):
     """
     h, w = bayer_blc_float.shape
     # 1. 归一化。假设信号范围是 1023 (10-bit)。
-    # 注意：此时黑电平已经是0，所以直接除以最大值即可。
-    normalized_bayer = bayer_blc_float / (1023.0 - 64.0) # 使用平均G通道黑电平作为基准
+    # 注意：此时黑电平已经是0，直接除以最大有效信号值即可。
+    # 使用一个固定的平均G通道黑电平作为基准来计算范围
+    max_signal_value = 1023.0 - 64.0 
+    normalized_bayer = bayer_blc_float / max_signal_value
     normalized_bayer = np.clip(normalized_bayer, 0, 1.0)
 
     # 2. 初始化四个独立的通道
@@ -469,7 +471,7 @@ def save_gain_matrix_to_txt(matrix, channel_name, raw_path_for_naming, output_ba
     print(f"已保存 {header.split('-')[0].strip()} 至: {filename}")
 
 # 【算法升级】平滑函数，增加中值滤波来消除尖锐的噪声脉冲
-def smooth_table(table, median_ksize=3, gaussian_ksize=3):
+def smooth_table(table, median_ksize=5, gaussian_ksize=5):
     """
     对矩阵进行平滑处理。
     先使用中值滤波消除孤立的尖锐脉冲噪声，然后使用高斯模糊进行整体平滑。
@@ -534,17 +536,18 @@ def create_falloff_map(rows, cols, falloff_at_edge):
             
     return falloff_map
 
-# --- 【算法升级】核心校准函数，使用固定中心点 ---
-# --- 【V3 - 逻辑重构】核心校准函数 ---
+# --- 【V4 - 全Bayer模式支持】核心校准函数 ---
 def perform_lsc_calibration(raw_img_path, width, height, bayer_pattern,
                             grid_rows, grid_cols,
                             black_levels_dict,
                             output_dir,
                             feather_pixels=100, max_gain=4.0,
                             valid_grid_threshold_ratio=0.2,
-                            falloff_factor=1.0, # Luma falloff
-                            color_falloff_factor=1.0, # Chroma falloff
+                            falloff_factor=1.0,
                             use_manual_selection=True):
+    # FALLOFF_FACTOR和COLOR_FALLOFF_FACTOR将在函数内部的旧逻辑中被使用
+    global COLOR_FALLOFF_FACTOR
+
     print(f"--- 开始LSC标定，生成平台增益表：{os.path.basename(raw_img_path)} ---")
     print(f"图像尺寸: {width}x{height}, 网格大小: {grid_rows}x{grid_cols}, 黑电平: {black_levels_dict}")
     
@@ -552,20 +555,37 @@ def perform_lsc_calibration(raw_img_path, width, height, bayer_pattern,
     if original_bayer_16bit is None: return None, None, None, None
     h, w = original_bayer_16bit.shape
 
-    # 1. 【核心修改】首先，创建全局的、去除黑电平后的bayer数据
+    # 1. 【核心重构】创建全局的、去除黑电平后的bayer数据
     bl_map = np.zeros_like(original_bayer_16bit, dtype=np.float32)
-    if bayer_pattern == cv2.COLOR_BayerGR2BGR_VNG: # GRBG
+    
+    # --- 为所有Bayer Pattern补全逻辑 ---
+    if bayer_pattern == cv2.COLOR_BayerRG2BGR_VNG: # RGGB
+        bl_map[0::2, 0::2] = black_levels_dict['R']
+        bl_map[0::2, 1::2] = black_levels_dict['Gr']
+        bl_map[1::2, 0::2] = black_levels_dict['Gb']
+        bl_map[1::2, 1::2] = black_levels_dict['B']
+    elif bayer_pattern == cv2.COLOR_BayerGR2BGR_VNG: # GRBG
         bl_map[0::2, 0::2] = black_levels_dict['Gr']
         bl_map[0::2, 1::2] = black_levels_dict['R']
         bl_map[1::2, 0::2] = black_levels_dict['B']
         bl_map[1::2, 1::2] = black_levels_dict['Gb']
-    # ... 其他bayer pattern的逻辑 ...
-    else: raise ValueError(f"BLC Map creation not implemented for this Bayer Pattern: {bayer_pattern}")
+    elif bayer_pattern == cv2.COLOR_BayerBG2BGR_VNG: # BGGR (新增)
+        bl_map[0::2, 0::2] = black_levels_dict['B']
+        bl_map[0::2, 1::2] = black_levels_dict['Gb']
+        bl_map[1::2, 0::2] = black_levels_dict['Gr']
+        bl_map[1::2, 1::2] = black_levels_dict['R']
+    elif bayer_pattern == cv2.COLOR_BayerGB2BGR_VNG: # GBRG (新增)
+        bl_map[0::2, 0::2] = black_levels_dict['Gb']
+        bl_map[0::2, 1::2] = black_levels_dict['B']
+        bl_map[1::2, 0::2] = black_levels_dict['R']
+        bl_map[1::2, 1::2] = black_levels_dict['Gr']
+    else: 
+        raise ValueError(f"BLC Map creation not implemented for this Bayer Pattern: {bayer_pattern}")
     
     # 得到“纯净信号”的浮点bayer图
     bayer_blc_float = np.maximum(0, original_bayer_16bit.astype(np.float32) - bl_map)
 
-    # 2. 准备预览图 (此部分逻辑不变)
+    # 2. 准备预览图 (此部分逻辑不变，仍然使用旧方法创建临时预览)
     avg_bl = (black_levels_dict['Gr'] + black_levels_dict['Gb']) / 2.0
     preview_bayer_8bit = (np.maximum(0, original_bayer_16bit.astype(np.float32) - avg_bl) * (255.0 / (1023.0 - avg_bl))).astype(np.uint8)
     original_rgb_float_no_wb = cv2.cvtColor(preview_bayer_8bit, bayer_pattern).astype(np.float32) / 255.0
@@ -578,7 +598,7 @@ def perform_lsc_calibration(raw_img_path, width, height, bayer_pattern,
     # 3. 计算增益 (输入的是已经去除黑电平的数据)
     bayer_channels_float = extract_bayer_channels(bayer_blc_float, bayer_pattern)
     
-    # ... (从这里开始到 final_gain_matrices 计算结束的所有代码，都使用您上一轮已经修改好的、包含“终极修正”的版本) ...
+    # --- 后续的LSC计算逻辑保持不变 ---
     H_grid_cell_size = h // grid_rows
     W_grid_cell_size = w // grid_cols
     H_grid_cell_size = max(H_grid_cell_size, 1)
@@ -595,10 +615,7 @@ def perform_lsc_calibration(raw_img_path, width, height, bayer_pattern,
                 valid_pixels = (grid_area_channel > epsilon) & (mask_area > epsilon)
                 if np.any(valid_pixels):
                     grid_brightness_maps[ch_name][i, j] = np.sum(grid_area_channel[valid_pixels] * mask_area[valid_pixels]) / (np.sum(mask_area[valid_pixels]) + epsilon)
-                else:
-                    grid_brightness_maps[ch_name][i, j] = 0.0
 
-    print("\n--- 开始使用最终精细算法计算增益 (V15.5) ---")
     G_avg_map = (grid_brightness_maps['Gr'] + grid_brightness_maps['Gb']) / 2.0
     R_map, B_map = grid_brightness_maps['R'], grid_brightness_maps['B']
     if np.max(G_avg_map) < epsilon:
@@ -639,8 +656,7 @@ def perform_lsc_calibration(raw_img_path, width, height, bayer_pattern,
     gain_G_smoothed = smooth_table(gain_G_falloff)
     final_gain_G = gain_G_smoothed
     if APPLY_SYMMETRY: final_gain_G = symmetrize_table(final_gain_G)
-    print(f"Creating aggressive color falloff map, edge factor: {color_falloff_factor}")
-    color_falloff_map = create_falloff_map(grid_rows, grid_cols, color_falloff_factor)
+    color_falloff_map = create_falloff_map(grid_rows, grid_cols, COLOR_FALLOFF_FACTOR)
     final_gain_R = final_gain_G * (1.0 + (ratio_correction_R_processed - 1.0) * color_falloff_map)
     final_gain_B = final_gain_G * (1.0 + (ratio_correction_B_processed - 1.0) * color_falloff_map)
     final_gain_R[~master_valid_mask] = 1.0
@@ -653,7 +669,7 @@ def perform_lsc_calibration(raw_img_path, width, height, bayer_pattern,
         'B': np.clip(final_gain_B, 1.0, max_gain)
     }
     
-    # 4. 【核心修改】将增益应用到去除黑电平后的数据上
+    # 4. 【核心重构】将增益应用到去除黑电平后的数据上
     gain_map_R_full = cv2.resize(final_gain_matrices['R'], (w, h), interpolation=cv2.INTER_LINEAR)
     gain_map_Gr_full = cv2.resize(final_gain_matrices['Gr'], (w, h), interpolation=cv2.INTER_LINEAR)
     gain_map_Gb_full = cv2.resize(final_gain_matrices['Gb'], (w, h), interpolation=cv2.INTER_LINEAR)
@@ -667,7 +683,8 @@ def perform_lsc_calibration(raw_img_path, width, height, bayer_pattern,
     
     # 5. 可视化和保存
     # 注意：compensated_bayer_blc_float已经是纯信号，不需要再减黑电平
-    compensated_bayer_8bit = (np.clip(compensated_bayer_blc_float, 0, 1023-avg_bl) * (255.0 / (1023.0-avg_bl))).astype(np.uint8)
+    max_display_val = 1023.0 - avg_bl
+    compensated_bayer_8bit = (np.clip(compensated_bayer_blc_float, 0, max_display_val) * (255.0 / max_display_val)).astype(np.uint8)
     compensated_rgb_float = cv2.cvtColor(compensated_bayer_8bit, bayer_pattern).astype(np.float32) / 255.0
     compensated_rgb_float = compensated_rgb_float * np.stack([feathered_mask_2d] * 3, axis=-1)
     compensated_rgb_float = np.clip(compensated_rgb_float, 0.0, 1.0)
@@ -676,7 +693,6 @@ def perform_lsc_calibration(raw_img_path, width, height, bayer_pattern,
     compensated_rgb_float_wb = simple_white_balance(compensated_rgb_float, mask_2d=feathered_mask_2d)
 
     return original_rgb_float_wb, compensated_rgb_float_wb, original_rgb_float_no_wb, final_gain_matrices
-
 
 # 【恢复】可视化函数
 def visualize_results_circle_mask(original_img_wb, compensated_img_wb, original_img_no_wb, final_gain_matrices, output_dir='.'):
